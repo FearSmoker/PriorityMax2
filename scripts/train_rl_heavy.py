@@ -1032,7 +1032,7 @@ def build_arg_parser():
     parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension size")
     parser.add_argument("--envs", type=int, default=16, help="Number of parallel environments")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")  # ADDED
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     
     # Experiment tracking
     parser.add_argument("--exp-name", default="prioritymax_rl_heavy", help="Experiment name")
@@ -1043,8 +1043,8 @@ def build_arg_parser():
     parser.add_argument("--resume", default=None, help="Resume from checkpoint path")
     parser.add_argument("--dry-run", action="store_true", help="Dry run mode (print config only)")
     parser.add_argument("--checkpoint-dir", default=str(DEFAULT_MODELS_DIR), help="Checkpoint directory")
-    parser.add_argument("--eval-interval", type=int, default=10, help="Evaluation interval (epochs)")  # ADDED
-    parser.add_argument("--checkpoint-interval", type=int, default=10, help="Checkpoint save interval")  # ADDED
+    parser.add_argument("--eval-interval", type=int, default=10, help="Evaluation interval (epochs)")
+    parser.add_argument("--checkpoint-interval", type=int, default=10, help="Checkpoint save interval")
     
     return parser
 
