@@ -144,7 +144,8 @@ class PPOActorCritic(nn.Module):
         dist = torch.distributions.Normal(mu, std)
         action = dist.sample()
         logp = dist.log_prob(action).sum(axis=-1)
-        return action, logp
+        value = self.value(obs)
+        return action, logp, value
 
     def value(self, obs: torch.Tensor):
         return self.critic(obs)

@@ -13,10 +13,10 @@ Purpose:
 
 Usage examples:
   # single-node multi-GPU (DDP)
-  python3 backend/scripts/train_rl_heavy.py --epochs 200 --steps-per-epoch 8192 --gpus 2 --exp-name pmax_ppo_v1
+  python3 scripts/train_rl_heavy.py --epochs 200 --steps-per-epoch 8192 --gpus 2 --exp-name pmax_ppo_v1
 
   # with Ray (if enabled)
-  python3 backend/scripts/train_rl_heavy.py --use-ray --ray-address auto --epochs 1000 --gpus 8
+  python3 scripts/train_rl_heavy.py --use-ray --ray-address auto --epochs 1000 --gpus 8
 
 Notes:
  - This file is intentionally defensive: it runs even if optional deps missing.
@@ -38,8 +38,13 @@ import logging
 import pathlib
 import tempfile
 import argparse
+import statistics
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Tuple, List, Sequence, Callable
+from collections import deque, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
 
 # ---------------------------
 # Optional heavy deps (best-effort import)
@@ -195,11 +200,7 @@ class HeavyRLConfig:
 def set_seed(seed: int):
     """Set random seeds for reproducibility."""
     random.seed(seed)
-    try:
-        import numpy as _np
-        _np.random.seed(seed)
-    except Exception:
-        pass
+    np.random.seed(seed)
     if _HAS_TORCH:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -329,12 +330,12 @@ if _HAS_TORCH:
             value = self.value_net(obs).squeeze(-1)
             return action_mean, value
 
-        def get_action(self, obs: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        def get_action(self, obs: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             mean, value = self.forward(obs)
             std = torch.exp(self.log_std)
             if deterministic:
                 action = mean
-                logp = None
+                logp = torch.zeros(mean.shape[0], device=mean.device)
             else:
                 dist = torch.distributions.Normal(mean, std)
                 action = dist.sample()
@@ -345,7 +346,59 @@ else:
     ActorCriticNet = None
 
 # ---------------------------
-# PPO Trainer core (skeleton)
+# Small VecEnv shim (fallback)
+# ---------------------------
+class SimpleVecEnv:
+    """
+    Simple synchronous vectorized environment wrapper for a list of envs.
+    Provides:
+      - reset() -> list of obs
+      - step(actions_list) -> next_obs_list, reward_list, done_list, info_list
+    """
+    def __init__(self, envs: List[Any]):
+        self.envs = envs
+        self.num_envs = len(envs)
+
+    def reset(self, seed: Optional[int] = None):
+        obs = []
+        for i, e in enumerate(self.envs):
+            try:
+                if hasattr(e, "reset"):
+                    o = e.reset(seed=(seed + i) if seed is not None else None)
+                    obs.append(o)
+                else:
+                    obs.append(None)
+            except Exception:
+                LOG.exception("env reset failed for idx=%d", i)
+                obs.append(None)
+        return obs
+
+    def step(self, actions: Sequence[Any]):
+        next_obs = []
+        rewards = []
+        dones = []
+        infos = []
+        for i, e in enumerate(self.envs):
+            try:
+                a = actions[i]
+                o, r, d, info = e.step(a)
+                next_obs.append(o)
+                rewards.append(r)
+                dones.append(d)
+                infos.append(info)
+                if d:
+                    o = e.reset()
+                    next_obs[-1] = o
+            except Exception:
+                LOG.exception("env step failed idx=%d", i)
+                next_obs.append(None)
+                rewards.append(0.0)
+                dones.append(True)
+                infos.append({})
+        return next_obs, rewards, dones, infos
+
+# ---------------------------
+# PPO Trainer core
 # ---------------------------
 class PPOTrainer:
     """
@@ -362,7 +415,6 @@ class PPOTrainer:
         self.run_name = cfg.run_name or default_run_name("ppo")
         self.device = torch.device("cuda" if (_HAS_TORCH and torch.cuda.is_available()) else "cpu")
         if _HAS_TORCH and cfg.gpus > 0 and torch.cuda.is_available():
-            # if single-node multi-GPU and use_ddp specified, caller must have launched via torch.distributed.launch or similar.
             LOG.info("Torch available. CUDA: %s, device=%s", torch.cuda.is_available(), self.device)
         else:
             LOG.info("Using device: %s", self.device)
@@ -386,10 +438,13 @@ class PPOTrainer:
         otherwise falls back to a basic local vectorization.
         """
         LOG.info("Creating %d envs (env_name=%s)", self.cfg.num_envs, self.cfg.env_name)
-        if make_vec_env:
+        if make_vec_env and SimulatedRealEnv:
             try:
-                env = make_vec_env(EnvConfig(mode="sim", seed=self.cfg.env_seed), n=self.cfg.num_envs)
-                return env
+                env_list = make_vec_env(EnvConfig(mode="sim", seed=self.cfg.env_seed), n=self.cfg.num_envs)
+                # make_vec_env returns a list, so wrap it in SimpleVecEnv
+                if isinstance(env_list, list):
+                    return SimpleVecEnv(env_list)
+                return env_list
             except Exception:
                 LOG.exception("make_vec_env failed; falling back to simple wrappers")
         # Fallback: create list of independent envs wrapped in a minimal VecEnv shim
@@ -406,11 +461,14 @@ class PPOTrainer:
     def init_model(self, obs_dim: int, act_dim: int):
         if not _HAS_TORCH:
             raise RuntimeError("PyTorch required to init model")
-        LOG.info("Initializing ActorCriticNet (obs=%d act=%d)", obs_dim, act_dim)
-        self.model = ActorCriticNet(obs_dim, act_dim, policy_hidden=self.cfg.policy_hidden_layers, value_hidden=self.cfg.value_hidden_layers, activation=self.cfg.activation)
+        if obs_dim is None or obs_dim <= 0:
+            raise ValueError(f"obs_dim must be a positive integer, got {obs_dim}")
+        if act_dim is None or act_dim <= 0:
+            raise ValueError(f"act_dim must be a positive integer, got {act_dim}")
+        LOG.info("Initializing ActorCriticNet (obs=%d act=%d)", int(obs_dim), int(act_dim))
+        self.model = ActorCriticNet(int(obs_dim), int(act_dim), policy_hidden=self.cfg.policy_hidden_layers, value_hidden=self.cfg.value_hidden_layers, activation=self.cfg.activation)
         self.model.to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.lr)
-        # If resume and DDP, wrap model later as part of distributed init
         return self.model
 
     # -------------------------
@@ -419,14 +477,11 @@ class PPOTrainer:
     def setup_distributed(self):
         """
         Placeholder for torch.distributed / Ray initialization.
-        For DDP, users should launch via torch.distributed.launch or torchrun with WORLD_SIZE and RANK env vars set.
-        This function can be extended to run local init_process_group in containerized clusters.
         """
         if not _HAS_TORCH:
             LOG.warning("Torch not available; skipping distributed setup")
             return
         if self.cfg.use_ddp:
-            # Basic local init if env var present; else expect external launch
             try:
                 if "RANK" in os.environ and "WORLD_SIZE" in os.environ and "MASTER_ADDR" in os.environ:
                     rank = int(os.environ.get("RANK", "0"))
@@ -434,9 +489,8 @@ class PPOTrainer:
                     backend = os.environ.get("DDP_BACKEND", "nccl" if torch.cuda.is_available() else "gloo")
                     LOG.info("Initializing torch.distributed (backend=%s rank=%s world_size=%s)", backend, rank, world_size)
                     torch.distributed.init_process_group(backend=backend)
-                    # wrap model in DDP after model created
                 else:
-                    LOG.info("No distributed env vars found; skipping in-process init. Expect external launcher for DDP.")
+                    LOG.info("No distributed env vars found; skipping in-process init.")
             except Exception:
                 LOG.exception("Distributed init failed")
         if self.cfg.use_ray and _HAS_RAY:
@@ -445,99 +499,18 @@ class PPOTrainer:
                     ray.init(address=self.cfg.ray_address, ignore_reinit_error=True)
                 else:
                     ray.init(ignore_reinit_error=True)
-                LOG.info("Ray initialized (address=%s)", ray._private.services.get_node_ip_address())
+                LOG.info("Ray initialized")
             except Exception:
-                LOG.exception("Ray initialization failed; continuing without Ray")
+                LOG.exception("Ray initialization failed")
 
 # ---------------------------
-# Small VecEnv shim (fallback)
-# ---------------------------
-class SimpleVecEnv:
-    """
-    Simple synchronous vectorized environment wrapper for a list of envs.
-    Provides:
-      - reset() -> list of obs
-      - step(actions_list) -> next_obs_list, reward_list, done_list, info_list
-    """
-    def __init__(self, envs: List[Any]):
-        self.envs = envs
-        self.num_envs = len(envs)
-
-    def reset(self, seed: Optional[int] = None):
-        obs = []
-        for i, e in enumerate(self.envs):
-            try:
-                if hasattr(e, "reset"):
-                    obs.append(e.reset(seed=(seed + i) if seed is not None else None))
-                else:
-                    obs.append(None)
-            except Exception:
-                LOG.exception("env reset failed for idx=%d", i)
-                obs.append(None)
-        return obs
-
-    def step(self, actions: Sequence[Any]):
-        next_obs = []
-        rewards = []
-        dones = []
-        infos = []
-        for i, e in enumerate(self.envs):
-            try:
-                a = actions[i]
-                o, r, d, info = e.step(a)
-                next_obs.append(o)
-                rewards.append(r)
-                dones.append(d)
-                infos.append(info)
-                if d:
-                    o = e.reset()
-            except Exception:
-                LOG.exception("env step failed idx=%d", i)
-                next_obs.append(None)
-                rewards.append(0.0)
-                dones.append(True)
-                infos.append({})
-        return next_obs, rewards, dones, infos
-
-# ---------------------------
-# GAE computation (vectorized-friendly)
-# ---------------------------
-def compute_gae(rewards, values, last_value, gamma: float, lam: float):
-    """
-    rewards: sequence (T,) or array
-    values: sequence (T,) - value estimates for each step
-    returns: advantages (T,), returns_to_go (T,)
-    Basic implementation for flattened trajectory. For vectorized per-env GAE, compute per-env.
-    """
-    T = len(rewards)
-    adv = [0.0] * T
-    lastgaelam = 0.0
-    for t in reversed(range(T)):
-        next_value = values[t+1] if (t+1) < len(values) else last_value
-        delta = rewards[t] + gamma * next_value - values[t]
-        lastgaelam = delta + gamma * lam * lastgaelam
-        adv[t] = lastgaelam
-    returns = [adv[i] + values[i] for i in range(T)]
-    return adv, returns
-
-# ---------------------------
-# Chunk 2 — Data buffers, rollout collection, PPO update, evaluation, logging hooks
-# ---------------------------
-
-import statistics
-from collections import deque, defaultdict
-from concurrent.futures import ThreadPoolExecutor
-
-# ---------------------------
-# Trajectory Buffer (flattened, supports vectorized envs)
+# Trajectory Buffer
 # ---------------------------
 class TrajectoryBuffer:
     """
     Stores observations, actions, rewards, values, logps for a single collection cycle.
-    Designed for flattened trajectories from vectorized envs.
-    After collection, compute advantages (GAE) and returns, then provide minibatches.
     """
-    def __init__(self, capacity: int, obs_shape: Tuple[int, ...], act_dim: int, device: Optional[Any] = None):
+    def __init__(self, capacity: int, device: Optional[Any] = None):
         self.capacity = capacity
         self.obs = []
         self.actions = []
@@ -563,7 +536,14 @@ class TrajectoryBuffer:
         return self.ptr
 
     def clear(self):
-        self.__init__(self.capacity, (), 0, device=self.device)
+        self.obs = []
+        self.actions = []
+        self.rewards = []
+        self.values = []
+        self.logps = []
+        self.dones = []
+        self.infos = []
+        self.ptr = 0
 
     def compute_advantages(self, last_value: float, gamma: float, lam: float):
         advs = [0.0] * self.ptr
@@ -575,40 +555,17 @@ class TrajectoryBuffer:
             lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
             advs[t] = lastgaelam
         returns = [advs[i] + self.values[i] for i in range(self.ptr)]
-        # convert to numpy arrays for batching
-        try:
-            import numpy as _np
-            obs_arr = _np.asarray(self.obs, dtype=_np.float32)
-            acts_arr = _np.asarray(self.actions, dtype=_np.float32)
-            adv_arr = _np.asarray(advs, dtype=_np.float32)
-            ret_arr = _np.asarray(returns, dtype=_np.float32)
-            logp_arr = _np.asarray(self.logps, dtype=_np.float32)
-        except Exception:
-            obs_arr = self.obs
-            acts_arr = self.actions
-            adv_arr = advs
-            ret_arr = returns
-            logp_arr = self.logps
+        # convert to numpy arrays
+        obs_arr = np.asarray(self.obs, dtype=np.float32)
+        acts_arr = np.asarray(self.actions, dtype=np.float32)
+        adv_arr = np.asarray(advs, dtype=np.float32)
+        ret_arr = np.asarray(returns, dtype=np.float32)
+        logp_arr = np.asarray(self.logps, dtype=np.float32)
         # normalize advantages
-        try:
-            adv_mean = float(adv_arr.mean())
-            adv_std = float(adv_arr.std()) if float(adv_arr.std()) > 1e-8 else 1.0
-            adv_arr = (adv_arr - adv_mean) / (adv_std + 1e-8)
-        except Exception:
-            pass
+        adv_mean = float(adv_arr.mean())
+        adv_std = float(adv_arr.std()) if float(adv_arr.std()) > 1e-8 else 1.0
+        adv_arr = (adv_arr - adv_mean) / (adv_std + 1e-8)
         return {"obs": obs_arr, "acts": acts_arr, "advs": adv_arr, "rets": ret_arr, "logps": logp_arr}
-
-    def minibatch_generator(self, data: Dict[str, Any], batch_size: int, shuffle: bool = True):
-        """
-        Yields minibatches of the flattened trajectory data.
-        """
-        n = len(data["advs"])
-        indices = list(range(n))
-        if shuffle:
-            random.shuffle(indices)
-        for start in range(0, n, batch_size):
-            batch_idx = indices[start:start + batch_size]
-            yield {k: (data[k][batch_idx] if hasattr(data[k], "__getitem__") else [data[k][i] for i in batch_idx]) for k in data}
 
 # ---------------------------
 # Utility: safe tensor conversion
@@ -616,18 +573,11 @@ class TrajectoryBuffer:
 def to_tensor(x, device=None):
     if not _HAS_TORCH:
         return x
-    try:
-        import numpy as _np
-        if isinstance(x, _np.ndarray):
-            return torch.from_numpy(x).to(device)
-        if isinstance(x, list):
-            return torch.tensor(x, dtype=torch.float32, device=device)
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x).to(device)
+    if isinstance(x, list):
         return torch.tensor(x, dtype=torch.float32, device=device)
-    except Exception:
-        try:
-            return torch.tensor(x, dtype=torch.float32, device=device)
-        except Exception:
-            return x
+    return torch.tensor(x, dtype=torch.float32, device=device)
 
 # ---------------------------
 # Rollout collector
@@ -635,72 +585,46 @@ def to_tensor(x, device=None):
 def collect_rollout(trainer: PPOTrainer, total_steps: int) -> Tuple[TrajectoryBuffer, float]:
     """
     Collect a flattened trajectory of length total_steps from trainer.envs.
-    Returns TrajectoryBuffer and last_value for bootstrapping.
     """
     envs = trainer.envs or trainer.make_envs()
     trainer.envs = envs
     num_envs = getattr(envs, "num_envs", len(envs.envs) if hasattr(envs, "envs") else 1)
-    buf = TrajectoryBuffer(capacity=total_steps, obs_shape=(trainer.cfg.obs_dim or 0,), act_dim=trainer.cfg.act_dim, device=trainer.device)
+    buf = TrajectoryBuffer(capacity=total_steps, device=trainer.device)
 
     # initial reset
-    if hasattr(envs, "reset"):
-        obs_list = envs.reset(seed=trainer.cfg.env_seed)
-    else:
-        obs_list = [None] * num_envs
+    obs_list = envs.reset(seed=trainer.cfg.env_seed)
 
     steps_collected = 0
-    # We'll use a loop that collects actions for each env in sequence (vectorized)
     while steps_collected < total_steps:
         # prepare batch observation tensor
-        if _HAS_TORCH:
-            obs_tensor = to_tensor(obs_list, device=trainer.device)
-            if isinstance(obs_tensor, torch.Tensor) and obs_tensor.dim() == 1:
-                obs_tensor = obs_tensor.unsqueeze(0)
-            with torch.no_grad():
-                action_tensor, logp_tensor, value_tensor = trainer.model.get_action(obs_tensor, deterministic=False)
-            # ensure shapes
-            if isinstance(action_tensor, torch.Tensor):
-                actions = action_tensor.cpu().numpy()
-            else:
-                actions = action_tensor
-            if isinstance(logp_tensor, torch.Tensor):
-                logps = logp_tensor.cpu().numpy()
-            else:
-                logps = logp_tensor
-            if isinstance(value_tensor, torch.Tensor):
-                values = value_tensor.cpu().numpy()
-            else:
-                values = value_tensor
-        else:
-            # fallback: random actions
-            actions = [0.0] * num_envs
-            logps = [0.0] * num_envs
-            values = [0.0] * num_envs
+        obs_tensor = to_tensor(obs_list, device=trainer.device)
+        if isinstance(obs_tensor, torch.Tensor) and obs_tensor.dim() == 1:
+            obs_tensor = obs_tensor.unsqueeze(0)
+        
+        with torch.no_grad():
+            action_tensor, logp_tensor, value_tensor = trainer.model.get_action(obs_tensor, deterministic=False)
+        
+        # convert to numpy
+        actions = action_tensor.cpu().numpy()
+        logps = logp_tensor.cpu().numpy()
+        values = value_tensor.cpu().numpy()
 
         # perform step
         next_obs, rewards, dones, infos = envs.step(actions)
+        
         # store per-env
         for i in range(num_envs):
-            buf.add(obs_list[i], actions[i], rewards[i], values[i], logps[i] if logps is not None else 0.0, dones[i], info=infos[i] if infos else {})
+            buf.add(obs_list[i], actions[i], rewards[i], values[i], logps[i], dones[i], info=infos[i])
             steps_collected += 1
             if steps_collected >= total_steps:
                 break
         obs_list = next_obs
 
-    # compute last value bootstrap using last obs
-    last_val = 0.0
-    try:
-        if _HAS_TORCH:
-            last_obs_tensor = to_tensor(obs_list, device=trainer.device)
-            if isinstance(last_obs_tensor, torch.Tensor):
-                with torch.no_grad():
-                    _, last_val = trainer.model.forward(last_obs_tensor)
-                    if isinstance(last_val, torch.Tensor):
-                        last_val = float(last_val.mean().cpu().numpy())
-        else:
-            last_val = 0.0
-    except Exception:
-        last_val = 0.0
+    # compute last value bootstrap
+    last_obs_tensor = to_tensor(obs_list, device=trainer.device)
+    with torch.no_grad():
+        _, last_val = trainer.model.forward(last_obs_tensor)
+        last_val = float(last_val.mean().cpu().numpy())
 
     return buf, last_val
 
@@ -711,9 +635,6 @@ def ppo_update(trainer: PPOTrainer, buffer_data: Dict[str, Any], updates: int):
     """
     Perform PPO policy/value updates using the flattened buffer_data.
     """
-    if not _HAS_TORCH:
-        raise RuntimeError("PyTorch required for ppo_update")
-
     model = trainer.model
     optimizer = trainer.optimizer
     cfg = trainer.cfg
@@ -730,17 +651,20 @@ def ppo_update(trainer: PPOTrainer, buffer_data: Dict[str, Any], updates: int):
     stats = {"pi_loss": [], "v_loss": [], "entropy": [], "clipfrac": []}
 
     for ep in range(updates):
-        gen = trainer_buf_minibatches(obs_all, acts_all, advs_all, rets_all, old_logps_all, minibatch_size)
-        for batch in gen:
-            obs_b = to_tensor(batch["obs"], device=trainer.device)
-            acts_b = to_tensor(batch["acts"], device=trainer.device)
-            advs_b = to_tensor(batch["advs"], device=trainer.device)
-            rets_b = to_tensor(batch["rets"], device=trainer.device)
-            old_logp_b = to_tensor(batch["logps"], device=trainer.device)
+        indices = list(range(n))
+        random.shuffle(indices)
+        
+        for start in range(0, n, minibatch_size):
+            batch_idx = indices[start:start + minibatch_size]
+            
+            obs_b = to_tensor(obs_all[batch_idx], device=trainer.device)
+            acts_b = to_tensor(acts_all[batch_idx], device=trainer.device)
+            advs_b = to_tensor(advs_all[batch_idx], device=trainer.device)
+            rets_b = to_tensor(rets_all[batch_idx], device=trainer.device)
+            old_logp_b = to_tensor(old_logps_all[batch_idx], device=trainer.device)
 
             # forward
             action_mean, value_pred = model.forward(obs_b)
-            # compute distribution and logp for actions
             std = torch.exp(model.log_std)
             dist = torch.distributions.Normal(action_mean, std)
             new_logp = dist.log_prob(acts_b).sum(dim=-1)
@@ -773,75 +697,41 @@ def ppo_update(trainer: PPOTrainer, buffer_data: Dict[str, Any], updates: int):
     return summary
 
 # ---------------------------
-# Helper: minibatch generator (numpy-friendly)
-# ---------------------------
-def trainer_buf_minibatches(obs, acts, advs, rets, logps, batch_size):
-    try:
-        import numpy as _np
-        n = len(advs)
-        indices = list(range(n))
-        random.shuffle(indices)
-        for start in range(0, n, batch_size):
-            batch_idx = indices[start:start + batch_size]
-            yield {
-                "obs": _np.asarray(obs)[batch_idx],
-                "acts": _np.asarray(acts)[batch_idx],
-                "advs": _np.asarray(advs)[batch_idx],
-                "rets": _np.asarray(rets)[batch_idx],
-                "logps": _np.asarray(logps)[batch_idx]
-            }
-    except Exception:
-        # fallback lists
-        n = len(advs)
-        idxs = list(range(n))
-        random.shuffle(idxs)
-        for start in range(0, n, batch_size):
-            batch_idx = idxs[start:start + batch_size]
-            yield {
-                "obs": [obs[i] for i in batch_idx],
-                "acts": [acts[i] for i in batch_idx],
-                "advs": [advs[i] for i in batch_idx],
-                "rets": [rets[i] for i in batch_idx],
-                "logps": [logps[i] for i in batch_idx]
-            }
-
-# ---------------------------
 # Evaluation routine
 # ---------------------------
 def evaluate_policy(trainer: PPOTrainer, episodes: int = 8, deterministic: bool = True) -> Dict[str, Any]:
     """
-    Run the current policy for a number of episodes in a fresh env and return aggregated metrics.
+    Run the current policy for a number of episodes and return aggregated metrics.
     """
-    # create a separate single env for evaluation
     if SimulatedRealEnv:
         eval_env = SimulatedRealEnv(EnvConfig(mode="sim", seed=trainer.cfg.env_seed + 9999))
     else:
         raise RuntimeError("SimulatedRealEnv not available for evaluation")
+    
     rewards = []
     latencies = []
     backlogs = []
+    
     for ep in range(episodes):
         obs = eval_env.reset(seed=trainer.cfg.env_seed + ep)
         total_reward = 0.0
         for t in range(10000):
-            if _HAS_TORCH:
-                obs_t = to_tensor(obs, device=trainer.device)
-                if isinstance(obs_t, torch.Tensor) and obs_t.dim() == 1:
-                    obs_t = obs_t.unsqueeze(0)
-                with torch.no_grad():
-                    action, _, _ = trainer.model.get_action(obs_t, deterministic=deterministic)
-                if isinstance(action, torch.Tensor):
-                    action = action.cpu().numpy()[0]
-            else:
-                action = 0.0
+            obs_t = to_tensor(obs, device=trainer.device)
+            if isinstance(obs_t, torch.Tensor) and obs_t.dim() == 1:
+                obs_t = obs_t.unsqueeze(0)
+            
+            with torch.no_grad():
+                action, _, _ = trainer.model.get_action(obs_t, deterministic=deterministic)
+            
+            action = action.cpu().numpy()[0]
             obs, rew, done, info = eval_env.step(action)
             total_reward += rew
-            # try extract latency/backlog proxies from info
             latencies.append(info.get("latency", 0.0) if isinstance(info, dict) else 0.0)
             backlogs.append(info.get("backlog", 0) if isinstance(info, dict) else 0)
             if done:
                 break
         rewards.append(total_reward)
+    
     res = {
         "mean_reward": float(statistics.mean(rewards)) if rewards else 0.0,
         "std_reward": float(statistics.pstdev(rewards)) if rewards else 0.0,
@@ -889,10 +779,8 @@ def manage_checkpoint_retention(trainer: PPOTrainer, ckpt_path: str, metric_val:
     """
     Keep top-k checkpoints and optionally register best model in ModelRegistry.
     """
-    # add to list and prune
     trainer.best_metrics.append((ckpt_path, float(metric_val)))
     trainer.best_metrics = sorted(trainer.best_metrics, key=lambda x: x[1], reverse=True)[:trainer.cfg.checkpoint_top_k]
-    # remove files not in best_metrics
     keep = {p for p, _ in trainer.best_metrics}
     all_ckpts = list(pathlib.Path(trainer.cfg.checkpoint_dir).glob("rl_ckpt_*.pt"))
     for p in all_ckpts:
@@ -902,7 +790,6 @@ def manage_checkpoint_retention(trainer: PPOTrainer, ckpt_path: str, metric_val:
             except Exception:
                 LOG.debug("Failed to remove old checkpoint %s", p)
 
-    # promote top-1 to registry if available
     if trainer.registry and trainer.best_metrics:
         best_path = trainer.best_metrics[0][0]
         try:
@@ -912,15 +799,11 @@ def manage_checkpoint_retention(trainer: PPOTrainer, ckpt_path: str, metric_val:
             LOG.exception("Model registry promotion failed for %s", best_path)
 
 # ---------------------------
-# Chunk 3 — Full PPO training loop, evaluation integration, CLI entrypoint
+# Full PPO training loop
 # ---------------------------
-
 def train_heavy(cfg: HeavyRLConfig):
     """
     Core training entrypoint for PPO heavy trainer.
-    - Initializes envs, model, optimizer, and loggers
-    - Runs collection + PPO update + eval loops
-    - Saves checkpoints and logs metrics
     """
     if not _HAS_TORCH:
         raise RuntimeError("PyTorch is required for train_heavy")
@@ -934,7 +817,29 @@ def train_heavy(cfg: HeavyRLConfig):
     # create envs and model
     envs = trainer.make_envs()
     trainer.envs = envs
-    obs_dim = cfg.obs_dim or len(envs.reset()[0]) if hasattr(envs, "reset") else cfg.obs_dim
+    
+    # Properly detect observation dimension
+    if cfg.obs_dim:
+        obs_dim = cfg.obs_dim
+    else:
+        try:
+            obs_list = envs.reset(seed=cfg.env_seed)
+            if obs_list and len(obs_list) > 0:
+                first_obs = obs_list[0]
+                if isinstance(first_obs, np.ndarray):
+                    obs_dim = first_obs.shape[0] if len(first_obs.shape) > 0 else 1
+                elif hasattr(first_obs, '__len__'):
+                    obs_dim = len(first_obs)
+                else:
+                    obs_dim = 1
+                LOG.info("Auto-detected obs_dim=%d from environment", obs_dim)
+            else:
+                raise ValueError("Environment reset returned empty observation")
+        except Exception as e:
+            LOG.exception("Failed to auto-detect obs_dim: %s", e)
+            obs_dim = 8
+            LOG.warning("Using default obs_dim=%d", obs_dim)
+    
     act_dim = cfg.act_dim
     trainer.init_model(obs_dim, act_dim)
 
@@ -1016,12 +921,12 @@ def train_heavy(cfg: HeavyRLConfig):
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="PriorityMax Heavy PPO Trainer")
     
-    # Training schedule (support both epoch-based and timestep-based)
+    # Training schedule
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
     parser.add_argument("--steps-per-epoch", type=int, default=8192, help="Steps per epoch")
     parser.add_argument("--total-timesteps", type=int, default=None, help="Total timesteps (alternative to epochs)")
     
-    # Algorithm (for compatibility, only PPO supported)
+    # Algorithm
     parser.add_argument("--algo", type=str, default="ppo", choices=["ppo"], help="RL algorithm (only PPO supported)")
     
     # Model and optimization
@@ -1058,9 +963,8 @@ def main():
         LOG.info("Auto-converted --total-timesteps=%d to --epochs=%d (steps-per-epoch=%d)", 
                  args.total_timesteps, args.epochs, args.steps_per_epoch)
     elif args.epochs is None:
-        args.epochs = 500  # default
+        args.epochs = 500
     
-    # Validate algo (only PPO supported, but accept the arg for compatibility)
     if args.algo != "ppo":
         LOG.warning("Only PPO is supported. Ignoring --algo=%s", args.algo)
     
