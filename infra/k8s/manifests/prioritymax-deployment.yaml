@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prioritymax-api
+  labels:
+    app: prioritymax
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: prioritymax
+  template:
+    metadata:
+      labels:
+        app: prioritymax
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9001"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: prioritymax-operator
+      containers:
+      - name: api
+        image: ghcr.io/your-org/prioritymax:latest
+        imagePullPolicy: Always
+        command: ["python3", "-m", "app.main", "run", "--host", "0.0.0.0", "--port", "8000"]
+        ports:
+        - name: http
+          containerPort: 8000
+        - name: prometheus
+          containerPort: 9001
+        env:
+        - name: PRIORITYMAX_ENV
+          value: "prod"
+        - name: PRIORITYMAX_AUTOSCALE_MODE
+          value: "hybrid"
+        - name: PRIORITYMAX_PROMETHEUS_PORT
+          value: "9001"
+        - name: PRIORITYMAX_REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: prioritymax-secrets
+              key: redis_url
+        - name: PRIORITYMAX_MONGO_URI
+          valueFrom:
+            secretKeyRef:
+              name: prioritymax-secrets
+              key: mongo_uri
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prioritymax-service
+  labels:
+    app: prioritymax
+spec:
+  selector:
+    app: prioritymax
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+    - name: prometheus
+      port: 9001
+      targetPort: 9001
+  type: ClusterIP
+
+---
+# Optional Horizontal Pod Autoscaler (custom metrics enabled)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: prioritymax-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: prioritymax-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: queue_backlog
+      target:
+        type: AverageValue
+        averageValue: 500
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 30

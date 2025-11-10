@@ -1,0 +1,155 @@
+###############################################################################
+# PriorityMax — Full Enterprise Requirements
+# Version: Phase-3 (Production)
+# Python: 3.9–3.11
+# ---------------------------------------------------------------------------
+# Core stack:
+#  - FastAPI for API layer
+#  - Redis, Kafka, RabbitMQ queue backends
+#  - PyTorch + LightGBM + Scikit-learn for ML & RL models
+#  - Prometheus + Grafana for observability
+#  - MongoDB + SQLAlchemy for metadata persistence
+#  - S3-compatible storage (boto3, minio)
+#  - CI/CD & testing (pytest, coverage, black, flake8)
+###############################################################################
+
+##############################
+# Core Frameworks & ASGI
+##############################
+fastapi==0.115.2
+uvicorn[standard]==0.30.6
+starlette==0.40.0
+pydantic==2.9.2
+python-dotenv==1.0.1
+aiohttp==3.10.9
+httpx==0.27.2
+orjson==3.10.7
+ujson==5.10.0
+anyio==4.5.0
+async-timeout==4.0.3
+
+##############################
+# Databases & Storage
+##############################
+motor==3.5.1               # Async MongoDB client
+pymongo==4.10.1
+redis==5.1.1               # Redis core client
+aioredis==2.0.1
+SQLAlchemy==2.0.36
+databases==0.9.0
+alembic==1.14.0
+psycopg2-binary==2.9.9     # PostgreSQL
+boto3==1.35.39             # AWS S3 SDK
+minio==7.2.10              # MinIO compatible S3 backend
+
+##############################
+# Messaging & Queue Systems
+##############################
+aiokafka==0.10.0
+pika==1.3.2                # RabbitMQ
+confluent-kafka==2.5.3
+asyncio-pool==0.7.0
+tenacity==9.0.0            # for retry mechanisms
+
+##############################
+# Machine Learning (Supervised)
+##############################
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.5.2
+lightgbm==4.5.0
+joblib==1.4.2
+optuna==3.6.1              # Hyperparameter optimization
+ray[default]==2.36.0       # Distributed training/tuning support
+
+##############################
+# Reinforcement Learning (RL)
+##############################
+torch==2.4.1
+torchvision==0.19.1
+gymnasium==0.29.1
+stable-baselines3==2.3.2
+mlflow==2.17.1
+wandb==0.18.4
+tensorboard==2.18.0
+protobuf==5.28.2
+
+##############################
+# Monitoring & Observability
+##############################
+prometheus-client==0.21.0
+influxdb==5.3.2
+statsd==4.0.1
+jaeger-client==4.9.0
+opentelemetry-api==1.27.0
+opentelemetry-sdk==1.27.0
+opentelemetry-exporter-jaeger==1.27.0
+opentelemetry-instrumentation-fastapi==0.48b0
+opentelemetry-exporter-prometheus==0.48b0
+
+##############################
+# Security & Auth
+##############################
+passlib[bcrypt]==1.7.4
+pyjwt[crypto]==2.10.0
+cryptography==43.0.3
+python-jose==3.3.0
+itsdangerous==2.2.0
+
+##############################
+# Utility & Common Libraries
+##############################
+tqdm==4.67.0
+colorama==0.4.6
+humanize==4.11.0
+schedule==1.2.2
+psutil==6.0.0
+aiofiles==24.1.0
+pyyaml==6.0.2
+rich==13.9.2
+click==8.1.7
+filelock==3.16.1
+tomlkit==0.13.2
+
+##############################
+# Testing & Quality Assurance
+##############################
+pytest==8.3.3
+pytest-asyncio==0.23.8
+pytest-cov==6.0.0
+pytest-mock==3.14.0
+pytest-xdist==3.6.1
+coverage==7.6.3
+black==24.10.0
+flake8==7.1.1
+mypy==1.12.0
+isort==5.13.2
+bandit==1.8.2
+
+##############################
+# Deployment & DevOps
+##############################
+docker==7.1.0
+kubernetes==30.1.0
+helm-charts==1.0.2
+fabric==3.2.2
+gunicorn==23.0.0
+supervisor==4.2.5
+
+##############################
+# Simulation & Experimentation
+##############################
+matplotlib==3.9.2
+seaborn==0.13.2
+plotly==5.24.1
+scipy==1.14.1
+faker==33.1.0
+networkx==3.4.2
+
+##############################
+# Optional - Cloud Integrations
+##############################
+google-cloud-storage==2.18.2
+azure-storage-blob==12.23.1
+snowflake-connector-python==3.13.2
+requests==2.32.3

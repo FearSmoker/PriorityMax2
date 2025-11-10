@@ -1,0 +1,127 @@
+# =====================================================================
+# File: k8s/autoscaler-deployment.yaml
+# PriorityMax Autoscaler Deployment
+# =====================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prioritymax-autoscaler
+  namespace: default
+  labels:
+    app: prioritymax
+    component: autoscaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prioritymax
+      component: autoscaler
+  template:
+    metadata:
+      labels:
+        app: prioritymax
+        component: autoscaler
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9001"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: prioritymax-autoscaler
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: autoscaler
+          image: ghcr.io/your-org/prioritymax-autoscaler:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 9000
+              name: http
+            - containerPort: 9001
+              name: metrics
+          env:
+            # General autoscaler settings
+            - name: PRIORITYMAX_AUTOSCALER_MODE
+              value: "hybrid"
+            - name: PRIORITYMAX_PROMETHEUS_PORT
+              value: "9001"
+            - name: PRIORITYMAX_AUTOSCALER_INTERVAL
+              value: "10"
+            - name: PRIORITYMAX_AUTOSCALER_COOLDOWN
+              value: "30"
+            - name: PRIORITYMAX_RL_MODEL
+              value: "/models/rl_agent.pt"
+            - name: PRIORITYMAX_MODELS_DIR
+              value: "/models"
+            - name: PRIORITYMAX_QUEUE
+              value: "default"
+            - name: PRIORITYMAX_K8S_AUTOSCALE
+              value: "true"
+            - name: PRIORITYMAX_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PRIORITYMAX_K8S_DEPLOYMENT
+              value: "prioritymax-worker"
+            # Optional MLflow/W&B credentials if you log training metrics
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow.default.svc.cluster.local:5000"
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-secret
+                  key: api-key
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: config
+              mountPath: /config
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /autoscaler/status
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /autoscaler/status
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: prioritymax-models-pvc
+        - name: config
+          configMap:
+            name: prioritymax-autoscaler-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prioritymax-autoscaler
+  namespace: default
+  labels:
+    app: prioritymax
+    component: autoscaler
+spec:
+  type: ClusterIP
+  selector:
+    app: prioritymax
+    component: autoscaler
+  ports:
+    - name: http
+      port: 9000
+      targetPort: 9000
+    - name: metrics
+      port: 9001
+      targetPort: 9001

@@ -1,0 +1,116 @@
+# ================================
+# PriorityMax RL Agent Deployment
+# ================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prioritymax-rl-config
+  namespace: prioritymax
+  labels:
+    app: prioritymax
+    component: rl-agent
+data:
+  # Runtime configuration for rl_agent_prod.py
+  REDIS_URL: "redis://prioritymax-redis:6379/0"
+  MONGO_URL: "mongodb://prioritymax-mongo:27017/prioritymax"
+  RL_AGENT_LOOP_INTERVAL: "5"
+  RL_AGENT_ACTION_COOLDOWN: "10"
+  RL_AGENT_DRY_RUN: "false"
+  RL_AGENT_MIN_CONSUMERS: "1"
+  RL_AGENT_MAX_CONSUMERS: "200"
+  RL_AGENT_MAX_DELTA: "10"
+  RL_AGENT_SLA_MS: "500"
+  RL_AGENT_PROM_PORT: "9205"
+  PRIORITYMAX_MODELS_DIR: "/app/ml/models"
+  RL_AGENT_SEED: "42"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prioritymax-rl-agent
+  namespace: prioritymax
+  labels:
+    app: prioritymax
+    component: rl-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prioritymax
+      component: rl-agent
+  template:
+    metadata:
+      labels:
+        app: prioritymax
+        component: rl-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9205"
+        prometheus.io/path: "/metrics"
+    spec:
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: rl-agent
+          image: ghcr.io/prioritymax/rl-agent:latest
+          imagePullPolicy: Always
+          command: ["python3", "/app/ml/rl_agent_prod.py"]
+          envFrom:
+            - configMapRef:
+                name: prioritymax-rl-config
+          ports:
+            - name: metrics
+              containerPort: 9205
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: models-volume
+              mountPath: /app/ml/models
+            - name: logs-volume
+              mountPath: /app/logs
+        # Optional sidecar for Prometheus scraping or metrics relay
+        - name: prom-sidecar
+          image: prom/prometheus:v2.52.0
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+          ports:
+            - name: prom-metrics
+              containerPort: 9090
+          volumeMounts:
+            - name: prom-config
+              mountPath: /etc/prometheus
+      volumes:
+        - name: models-volume
+          persistentVolumeClaim:
+            claimName: prioritymax-models-pvc
+        - name: logs-volume
+          emptyDir: {}
+        - name: prom-config
+          configMap:
+            name: prioritymax-prom-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prioritymax-rl-agent
+  namespace: prioritymax
+  labels:
+    app: prioritymax
+    component: rl-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: prioritymax
+    component: rl-agent
+  ports:
+    - name: metrics
+      port: 9205
+      targetPort: 9205
+      protocol: TCP

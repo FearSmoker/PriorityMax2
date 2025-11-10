@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.jsonl
+*.sqlite3
+*.db
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data & models
+datasets/
+logs/
+sim_logs/
+checkpoints/
+app/ml/models/
+app/ml/experiments/
+wandb/
+mlruns/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+
+# System / IDE
+.DS_Store
+.idea/
+.vscode/

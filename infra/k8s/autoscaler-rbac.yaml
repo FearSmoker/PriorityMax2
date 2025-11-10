@@ -1,0 +1,93 @@
+# =====================================================================
+# File: k8s/autoscaler-rbac.yaml
+# PriorityMax Autoscaler Operator RBAC
+# =====================================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prioritymax-autoscaler
+  namespace: default
+  labels:
+    app: prioritymax
+    component: autoscaler
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prioritymax-autoscaler-role
+  namespace: default
+  labels:
+    app: prioritymax
+    component: autoscaler
+rules:
+  # Allow scaling Deployments (read/patch)
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # Allow managing HorizontalPodAutoscalers (HPA v2)
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # Allow reading custom metrics via adapter
+  - apiGroups: ["custom.metrics.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  # Allow listing pods for worker monitoring
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  # Allow reading ConfigMaps/Events (for debugging)
+  - apiGroups: [""]
+    resources: ["configmaps", "events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prioritymax-autoscaler-binding
+  namespace: default
+  labels:
+    app: prioritymax
+    component: autoscaler
+subjects:
+  - kind: ServiceAccount
+    name: prioritymax-autoscaler
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prioritymax-autoscaler-role
+---
+# (Optional) ClusterRole + ClusterRoleBinding variant if your autoscaler runs in multiple namespaces
+# Uncomment if needed:
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: ClusterRole
+# metadata:
+#   name: prioritymax-autoscaler-clusterrole
+# rules:
+#   - apiGroups: ["apps"]
+#     resources: ["deployments", "replicasets"]
+#     verbs: ["get", "list", "watch", "patch", "update"]
+#   - apiGroups: ["autoscaling"]
+#     resources: ["horizontalpodautoscalers"]
+#     verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+#   - apiGroups: ["custom.metrics.k8s.io"]
+#     resources: ["*"]
+#     verbs: ["get", "list", "watch"]
+#   - apiGroups: [""]
+#     resources: ["pods", "pods/log"]
+#     verbs: ["get", "list", "watch"]
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: ClusterRoleBinding
+# metadata:
+#   name: prioritymax-autoscaler-clusterrolebinding
+# subjects:
+#   - kind: ServiceAccount
+#     name: prioritymax-autoscaler
+#     namespace: default
+# roleRef:
+#   apiGroup: rbac.authorization.k8s.io
+#   kind: ClusterRole
+#   name: prioritymax-autoscaler-clusterrole

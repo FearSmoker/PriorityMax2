@@ -1,0 +1,17 @@
+# File: k8s/autoscaler-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prioritymax-autoscaler-config
+  namespace: default
+data:
+  policy.json: |
+    {
+      "min_workers": 2,
+      "max_workers": 50,
+      "target_cpu_percent": 70,
+      "custom_metrics": [
+        {"name": "prioritymax_queue_backlog", "type": "External", "target": {"type": "AverageValue", "averageValue": "500"}},
+        {"name": "prioritymax_rl_score", "type": "External", "target": {"type": "AverageValue", "averageValue": "0.5"}}
+      ]
+    }
