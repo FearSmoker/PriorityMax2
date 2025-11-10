@@ -193,6 +193,7 @@ class HeavyRLConfig:
 # Utilities
 # ---------------------------
 def set_seed(seed: int):
+    """Set random seeds for reproducibility."""
     random.seed(seed)
     try:
         import numpy as _np
@@ -519,12 +520,10 @@ def compute_gae(rewards, values, last_value, gamma: float, lam: float):
     returns = [adv[i] + values[i] for i in range(T)]
     return adv, returns
 
-# End of Chunk 1
 # ---------------------------
 # Chunk 2 — Data buffers, rollout collection, PPO update, evaluation, logging hooks
 # ---------------------------
 
-import math
 import statistics
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -633,10 +632,10 @@ def to_tensor(x, device=None):
 # ---------------------------
 # Rollout collector
 # ---------------------------
-def collect_rollout(trainer: PPOTrainer, total_steps: int) -> TrajectoryBuffer:
+def collect_rollout(trainer: PPOTrainer, total_steps: int) -> Tuple[TrajectoryBuffer, float]:
     """
     Collect a flattened trajectory of length total_steps from trainer.envs.
-    Returns TrajectoryBuffer.
+    Returns TrajectoryBuffer and last_value for bootstrapping.
     """
     envs = trainer.envs or trainer.make_envs()
     trainer.envs = envs
@@ -912,7 +911,6 @@ def manage_checkpoint_retention(trainer: PPOTrainer, ckpt_path: str, metric_val:
         except Exception:
             LOG.exception("Model registry promotion failed for %s", best_path)
 
-# End of Chunk 2
 # ---------------------------
 # Chunk 3 — Full PPO training loop, evaluation integration, CLI entrypoint
 # ---------------------------
@@ -948,13 +946,17 @@ def train_heavy(cfg: HeavyRLConfig):
             ckpt = load_checkpoint(cfg.resume_from)
             if "model_state_dict" in ckpt:
                 trainer.model.load_state_dict(ckpt["model_state_dict"])
-            LOG.info("Resumed from checkpoint %s", cfg.resume_from)
+            if "optimizer_state_dict" in ckpt and trainer.optimizer:
+                trainer.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if "epoch" in ckpt:
+                trainer.start_epoch = ckpt["epoch"] + 1
+            LOG.info("Resumed from checkpoint %s (epoch %d)", cfg.resume_from, trainer.start_epoch - 1)
         except Exception:
             LOG.exception("Failed to resume from %s", cfg.resume_from)
 
     # main training loop
     t0 = time.time()
-    for epoch in range(1, cfg.epochs + 1):
+    for epoch in range(trainer.start_epoch, cfg.epochs + 1):
         # collect rollout
         buf, last_val = collect_rollout(trainer, cfg.steps_per_epoch)
         data = buf.compute_advantages(last_val, cfg.gamma, cfg.lam)
@@ -1013,21 +1015,24 @@ def train_heavy(cfg: HeavyRLConfig):
 # ---------------------------
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="PriorityMax Heavy PPO Trainer")
-    parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--steps-per-epoch", type=int, default=8192)
-    parser.add_argument("--gpus", type=int, default=1)
-    parser.add_argument("--use-ddp", action="store_true")
-    parser.add_argument("--use-ray", action="store_true")
-    parser.add_argument("--ray-address", default=None)
-    parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--envs", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--exp-name", default="prioritymax_rl_heavy")
-    parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--mlflow", action="store_true")
-    parser.add_argument("--resume", default=None)
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--checkpoint-dir", default=str(DEFAULT_MODELS_DIR))
+    parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
+    parser.add_argument("--steps-per-epoch", type=int, default=8192, help="Steps per epoch")
+    parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs to use")
+    parser.add_argument("--use-ddp", action="store_true", help="Enable DistributedDataParallel")
+    parser.add_argument("--use-ray", action="store_true", help="Enable Ray distributed training")
+    parser.add_argument("--ray-address", default=None, help="Ray cluster address")
+    parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension size")
+    parser.add_argument("--envs", type=int, default=16, help="Number of parallel environments")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--exp-name", default="prioritymax_rl_heavy", help="Experiment name")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--mlflow", action="store_true", help="Enable MLflow logging")
+    parser.add_argument("--resume", default=None, help="Resume from checkpoint path")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run mode (print config only)")
+    parser.add_argument("--checkpoint-dir", default=str(DEFAULT_MODELS_DIR), help="Checkpoint directory")
+    parser.add_argument("--eval-interval", type=int, default=10, help="Evaluation interval (epochs)")
+    parser.add_argument("--checkpoint-interval", type=int, default=10, help="Checkpoint save interval")
     return parser
 
 def main():
@@ -1043,17 +1048,22 @@ def main():
         hidden_dim=args.hidden_dim,
         num_envs=args.envs,
         lr=args.lr,
+        gamma=args.gamma,
         experiment_name=args.exp_name,
         log_wandb=args.wandb,
         log_mlflow=args.mlflow,
         resume_from=args.resume,
         checkpoint_dir=args.checkpoint_dir,
+        eval_interval=args.eval_interval,
+        checkpoint_interval=args.checkpoint_interval,
         dry_run=args.dry_run,
     )
+    
     if cfg.dry_run:
         LOG.warning("Running in DRY-RUN mode (no training, test configs only).")
         print(json.dumps(asdict(cfg), indent=2))
         return
+    
     train_heavy(cfg)
 
 if __name__ == "__main__":
