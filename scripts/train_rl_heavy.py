@@ -1015,8 +1015,16 @@ def train_heavy(cfg: HeavyRLConfig):
 # ---------------------------
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="PriorityMax Heavy PPO Trainer")
-    parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
+    
+    # Training schedule (support both epoch-based and timestep-based)
+    parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
     parser.add_argument("--steps-per-epoch", type=int, default=8192, help="Steps per epoch")
+    parser.add_argument("--total-timesteps", type=int, default=None, help="Total timesteps (alternative to epochs)")
+    
+    # Algorithm (for compatibility, only PPO supported)
+    parser.add_argument("--algo", type=str, default="ppo", choices=["ppo"], help="RL algorithm (only PPO supported)")
+    
+    # Model and optimization
     parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs to use")
     parser.add_argument("--use-ddp", action="store_true", help="Enable DistributedDataParallel")
     parser.add_argument("--use-ray", action="store_true", help="Enable Ray distributed training")
@@ -1025,19 +1033,37 @@ def build_arg_parser():
     parser.add_argument("--envs", type=int, default=16, help="Number of parallel environments")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    
+    # Experiment tracking
     parser.add_argument("--exp-name", default="prioritymax_rl_heavy", help="Experiment name")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--mlflow", action="store_true", help="Enable MLflow logging")
+    
+    # Checkpointing
     parser.add_argument("--resume", default=None, help="Resume from checkpoint path")
     parser.add_argument("--dry-run", action="store_true", help="Dry run mode (print config only)")
     parser.add_argument("--checkpoint-dir", default=str(DEFAULT_MODELS_DIR), help="Checkpoint directory")
     parser.add_argument("--eval-interval", type=int, default=10, help="Evaluation interval (epochs)")
     parser.add_argument("--checkpoint-interval", type=int, default=10, help="Checkpoint save interval")
+    
     return parser
 
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+    
+    # Auto-convert total_timesteps to epochs if provided
+    if args.total_timesteps is not None and args.epochs is None:
+        args.epochs = max(1, args.total_timesteps // args.steps_per_epoch)
+        LOG.info("Auto-converted --total-timesteps=%d to --epochs=%d (steps-per-epoch=%d)", 
+                 args.total_timesteps, args.epochs, args.steps_per_epoch)
+    elif args.epochs is None:
+        args.epochs = 500  # default
+    
+    # Validate algo (only PPO supported, but accept the arg for compatibility)
+    if args.algo != "ppo":
+        LOG.warning("Only PPO is supported. Ignoring --algo=%s", args.algo)
+    
     cfg = HeavyRLConfig(
         epochs=args.epochs,
         steps_per_epoch=args.steps_per_epoch,
