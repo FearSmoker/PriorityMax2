@@ -62,6 +62,22 @@ import statistics
 
 import numpy as np
 
+# Try to use Gymnasium (preferred) or Gym (legacy), else fallback
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+    _HAS_GYM = True
+    LOG.info("Using Gymnasium (version %s)", getattr(gym, "__version__", "unknown"))
+except ImportError:
+    try:
+        import gym
+        from gym import spaces
+        _HAS_GYM = True
+        LOG.info("Using Gym (version %s)", getattr(gym, "__version__", "unknown"))
+    except Exception:
+        _HAS_GYM = False
+        LOG.warning("⚠️ Neither Gym nor Gymnasium found — using fallback space classes.")
+
 # Optional dependencies (best-effort imports)
 try:
     import pandas as pd
@@ -90,33 +106,6 @@ try:
 except Exception:
     CollectorRegistry = Gauge = Histogram = Counter = None
     _HAS_PROM = False
-
-# Try to use Gymnasium (preferred) or Gym (legacy), else fallback
-_HAS_GYM = False
-try:
-    import gymnasium as gym
-    from gymnasium import spaces
-    _HAS_GYM = True
-    LOG.info("Using Gymnasium (version %s)", gym.__version__)
-except Exception:
-    try:
-        import gym
-        from gym import spaces
-        _HAS_GYM = True
-        LOG.info("Using Gym (version %s)", gym.__version__)
-    except Exception:
-        LOG.warning("⚠️ Neither Gym nor Gymnasium found — using fallback space classes.")
-        class spaces:
-            class Box:
-                def __init__(self, low, high, shape=None, dtype=np.float32):
-                    self.low = low
-                    self.high = high
-                    self.shape = shape if shape is not None else (len(low),)
-                    self.dtype = dtype
-
-            class Discrete:
-                def __init__(self, n):
-                    self.n = n
                 
 # -------------------------------------------------------------------
 # SimpleSpace: fallback object for tests (used when gym not installed)
