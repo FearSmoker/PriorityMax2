@@ -62,21 +62,13 @@ import statistics
 
 import numpy as np
 
-# Try to use Gymnasium (preferred) or Gym (legacy), else fallback
-try:
-    import gymnasium as gym
-    from gymnasium import spaces
-    _HAS_GYM = True
-    LOG.info("Using Gymnasium (version %s)", getattr(gym, "__version__", "unknown"))
-except ImportError:
-    try:
-        import gym
-        from gym import spaces
-        _HAS_GYM = True
-        LOG.info("Using Gym (version %s)", getattr(gym, "__version__", "unknown"))
-    except Exception:
-        _HAS_GYM = False
-        LOG.warning("⚠️ Neither Gym nor Gymnasium found — using fallback space classes.")
+
+LOG = logging.getLogger("prioritymax.ml.real_env")
+LOG.setLevel(os.getenv("PRIORITYMAX_ENV_LOG", "INFO"))
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+if not LOG.handlers:
+    LOG.addHandler(_handler)
 
 # Optional dependencies (best-effort imports)
 try:
@@ -106,6 +98,22 @@ try:
 except Exception:
     CollectorRegistry = Gauge = Histogram = Counter = None
     _HAS_PROM = False
+
+# Try to use Gymnasium (preferred) or Gym (legacy), else fallback
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+    _HAS_GYM = True
+    LOG.info("Using Gymnasium (version %s)", getattr(gym, "__version__", "unknown"))
+except ImportError:
+    try:
+        import gym
+        from gym import spaces
+        _HAS_GYM = True
+        LOG.info("Using Gym (version %s)", getattr(gym, "__version__", "unknown"))
+    except Exception:
+        _HAS_GYM = False
+        LOG.warning("⚠️ Neither Gym nor Gymnasium found — using fallback space classes.")
                 
 # -------------------------------------------------------------------
 # SimpleSpace: fallback object for tests (used when gym not installed)
