@@ -195,25 +195,25 @@ class EnvConfig:
     action_cooldown_seconds: float = 5.0
     dry_run: bool = True  # SAFE DEFAULT
     
-    # Circuit Breaker
-    enable_circuit_breaker: bool = True
-    circuit_breaker_threshold: int = 5
-    circuit_breaker_window_seconds: int = 300
+    # Circuit Breaker (TUNED for training stability)
+    enable_circuit_breaker: bool = False  # Disabled by default for training
+    circuit_breaker_threshold: int = 20  # Higher threshold (was 5)
+    circuit_breaker_window_seconds: int = 60  # Shorter window (was 300)
     
     # Observation/Reward Windows
     obs_window_seconds: int = 60
     reward_latency_sla_ms: float = 500.0
     cost_per_worker_per_sec: float = 0.0005
     
-    # Simulation Parameters
+    # Simulation Parameters (TUNED for stable training)
     sim_target_throughput: float = 50.0
     sim_base_latency_ms: float = 100.0
-    sim_noise_scale: float = 0.2
-    sim_failure_rate: float = 0.02
-    sim_queue_arrival_rate: float = 5.0
+    sim_noise_scale: float = 0.1  # Reduced noise (was 0.2)
+    sim_failure_rate: float = 0.01  # Lower failure rate (was 0.02)
+    sim_queue_arrival_rate: float = 3.0  # Lower arrival rate (was 5.0)
     sim_max_queue: int = 10000
-    sim_burst_probability: float = 0.02
-    sim_burst_size: float = 20.0
+    sim_burst_probability: float = 0.01  # Less frequent bursts (was 0.02)
+    sim_burst_size: float = 10.0  # Smaller bursts (was 20.0)
     
     # Diurnal Pattern
     sim_diurnal_amplitude: float = 0.7
@@ -250,14 +250,18 @@ class EnvConfig:
 class CircuitBreaker:
     """
     Thread-safe circuit breaker for failure protection.
+    TUNED: More forgiving for RL training environments.
     """
-    def __init__(self, threshold: int = 5, window_seconds: int = 300):
+    def __init__(self, threshold: int = 20, window_seconds: int = 60):
         self.threshold = threshold
         self.window_seconds = window_seconds
         self.failures = deque()
+        self.successes = deque()  # Track successes too
         self.state = "CLOSED"  # CLOSED | OPEN | HALF_OPEN
         self.last_state_change = time.time()
         self.lock = threading.Lock()
+        self.half_open_attempts = 0
+        self.max_half_open_attempts = 3
         LOG.info("🔌 Circuit breaker initialized (threshold=%d, window=%ds)",
                 threshold, window_seconds)
     
@@ -272,27 +276,43 @@ class CircuitBreaker:
             while self.failures and self.failures[0] < cutoff:
                 self.failures.popleft()
             
-            # Check threshold
-            if len(self.failures) >= self.threshold and self.state == "CLOSED":
+            # Only open if failures significantly exceed successes
+            recent_successes = sum(1 for t in self.successes if t > cutoff)
+            failure_rate = len(self.failures) / max(1, len(self.failures) + recent_successes)
+            
+            if len(self.failures) >= self.threshold and failure_rate > 0.8 and self.state == "CLOSED":
                 self.state = "OPEN"
                 self.last_state_change = now
-                LOG.error("⚠️ CIRCUIT BREAKER OPENED - Too many failures (%d in %ds)",
-                         len(self.failures), self.window_seconds)
+                self.half_open_attempts = 0
+                LOG.error("⚠️ CIRCUIT BREAKER OPENED - Too many failures (%d/%d, rate=%.1f%%)",
+                         len(self.failures), len(self.failures) + recent_successes, failure_rate * 100)
                 write_audit_event({
                     "event": "circuit_breaker_opened",
-                    "failures": len(self.failures)
+                    "failures": len(self.failures),
+                    "failure_rate": failure_rate
                 })
     
     def record_success(self):
         """Record a success and potentially close circuit."""
         with self.lock:
+            now = time.time()
+            self.successes.append(now)
+            
+            # Prune old successes
+            cutoff = now - self.window_seconds
+            while self.successes and self.successes[0] < cutoff:
+                self.successes.popleft()
+            
             if self.state == "HALF_OPEN":
-                self.state = "CLOSED"
-                self.failures.clear()
-                LOG.info("✅ Circuit breaker CLOSED - System recovered")
-                write_audit_event({
-                    "event": "circuit_breaker_closed"
-                })
+                self.half_open_attempts += 1
+                if self.half_open_attempts >= self.max_half_open_attempts:
+                    self.state = "CLOSED"
+                    self.failures.clear()
+                    self.half_open_attempts = 0
+                    LOG.info("✅ Circuit breaker CLOSED - System recovered")
+                    write_audit_event({
+                        "event": "circuit_breaker_closed"
+                    })
     
     def can_execute(self) -> bool:
         """Check if actions are allowed."""
@@ -303,6 +323,7 @@ class CircuitBreaker:
             if self.state == "OPEN" and (now - self.last_state_change) > self.window_seconds:
                 self.state = "HALF_OPEN"
                 self.last_state_change = now
+                self.half_open_attempts = 0
                 LOG.info("🔄 Circuit breaker HALF_OPEN - Testing recovery")
             
             return self.state != "OPEN"
@@ -889,9 +910,11 @@ class RealEnvBase:
             sla_bonus = self.cfg.reward_sla_bonus
             total += sla_bonus
 
-        # Record success in circuit breaker
-        if self.circuit_breaker and succ > 0.99:
-            self.circuit_breaker.record_success()
+        # Record success in circuit breaker (more lenient criteria)
+        if self.circuit_breaker:
+            # Consider it a success if system is stable (not just perfect)
+            if succ > 0.8 and lat < sla * 2.0:  # More forgiving
+                self.circuit_breaker.record_success()
 
         details = {
             "latency_pen": latency_pen,
@@ -910,12 +933,21 @@ class RealEnvBase:
     # TERMINAL CONDITION
     # ---------------------------
     def _terminal_condition(self) -> bool:
-        """Check if episode should terminate."""
-        # Only terminate on catastrophic overload
-        if self.state["p95_latency_ms"] > 60000 or self.state["queue_length"] >= self.cfg.sim_max_queue * 0.95:
+        """
+        Check if episode should terminate.
+        TUNED: More lenient termination to allow learning.
+        """
+        # Only terminate on EXTREME overload (not during normal training)
+        catastrophic_latency = self.state["p95_latency_ms"] > 100000  # 100 seconds
+        catastrophic_queue = self.state["queue_length"] >= self.cfg.sim_max_queue * 0.99
+        
+        if catastrophic_latency or catastrophic_queue:
             if self.circuit_breaker:
                 self.circuit_breaker.record_failure()
+            LOG.warning("Episode terminated: lat=%.0fms queue=%.0f", 
+                       self.state["p95_latency_ms"], self.state["queue_length"])
             return True
+        
         return False
 
 # ---------------------------------------------------
@@ -934,16 +966,16 @@ class SimulatedRealEnv(RealEnvBase):
         self.sim_time_of_day = 0.0  # Minutes since midnight
         
     def _reset_state(self):
-        """Reset simulation state."""
+        """Reset simulation state with safer initial conditions."""
         self.state.update({
-            "queue_length": float(self.npr.randint(0, 50)),
-            "worker_count": float(self.npr.randint(self.cfg.min_workers, self.cfg.min_workers + 5)),
-            "avg_latency_ms": float(self.cfg.sim_base_latency_ms),
-            "p95_latency_ms": float(self.cfg.sim_base_latency_ms * 1.2),
-            "success_rate": 1.0,
-            "arrival_rate": self.cfg.sim_queue_arrival_rate,
-            "cpu": 0.2,
-            "mem": 0.2
+            "queue_length": float(self.npr.randint(0, 20)),  # Lower initial queue
+            "worker_count": float(self.npr.randint(self.cfg.min_workers, self.cfg.min_workers + 3)),
+            "avg_latency_ms": float(self.cfg.sim_base_latency_ms * 0.8),  # Start with good latency
+            "p95_latency_ms": float(self.cfg.sim_base_latency_ms * 1.0),
+            "success_rate": 0.98,  # Start with high success rate
+            "arrival_rate": self.cfg.sim_queue_arrival_rate * 0.5,  # Start with lower load
+            "cpu": 0.15,
+            "mem": 0.15
         })
         
         # Initialize heterogeneous worker efficiencies
