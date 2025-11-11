@@ -1,119 +1,156 @@
-###############################################################################
-# PriorityMax — Full Enterprise Requirements
-# Version: Phase-3 (Production)
-# Python: 3.9–3.11
-# ---------------------------------------------------------------------------
-# Core stack:
-#  - FastAPI for API layer
-#  - Redis, Kafka, RabbitMQ queue backends
-#  - PyTorch + LightGBM + Scikit-learn for ML & RL models
-#  - Prometheus + Grafana for observability
-#  - MongoDB + SQLAlchemy for metadata persistence
-#  - S3-compatible storage (boto3, minio)
-#  - CI/CD & testing (pytest, coverage, black, flake8)
-###############################################################################
-
-##############################
+# ===============================
 # Core Frameworks & ASGI
-##############################
+# ===============================
 fastapi==0.115.2
-uvicorn[standard]==0.30.6
 starlette==0.40.0
+uvicorn[standard]==0.30.6
 pydantic==2.9.2
+pydantic-core==2.23.4
 python-dotenv==1.0.1
 aiohttp==3.10.9
+async-timeout==4.0.3
+multidict==6.1.0
+yarl==1.13.1      # fixed for aiohttp 3.10.9
+frozenlist==1.5.0
 httpx==0.27.2
+sniffio==1.3.1
+anyio==4.5.0
 orjson==3.10.7
 ujson==5.10.0
-anyio==4.5.0
-async-timeout==4.0.3
+idna==3.10
+charset-normalizer==3.3.2
+typing-extensions==4.12.2
 
-##############################
+# ===============================
 # Databases & Storage
-##############################
-motor==3.5.1               # Async MongoDB client
+# ===============================
+motor==3.5.1
 pymongo==4.10.1
-redis==5.1.1               # Redis core client
+redis==5.1.1
 aioredis==2.0.1
 SQLAlchemy==2.0.36
+greenlet==3.1.1
 databases==0.9.0
 alembic==1.14.0
-psycopg2-binary==2.9.9     # PostgreSQL
-boto3==1.35.39             # AWS S3 SDK
-minio==7.2.10              # MinIO compatible S3 backend
+Mako==1.3.6
+psycopg2-binary==2.9.9
+boto3==1.35.39
+botocore==1.35.39
+s3transfer==0.10.3
+jmespath==1.0.1
+minio==7.2.10
+urllib3==2.2.3
 
-##############################
-# Messaging & Queue Systems
-##############################
+# ===============================
+# Messaging & Queues
+# ===============================
 aiokafka==0.10.0
-pika==1.3.2                # RabbitMQ
+kafka-python==2.0.2
+pika==1.3.2
 confluent-kafka==2.5.3
-asyncio-pool==0.7.0
-tenacity==9.0.0            # for retry mechanisms
+asyncio-pool==0.6.0
+tenacity==9.0.0
 
-##############################
+# ===============================
 # Machine Learning (Supervised)
-##############################
+# ===============================
 numpy==1.26.4
 pandas==2.2.3
+python-dateutil==2.9.0.post0
+pytz==2024.2
+tzdata==2024.2
 scikit-learn==1.5.2
-lightgbm==4.5.0
+scipy==1.14.1
 joblib==1.4.2
-optuna==3.6.1              # Hyperparameter optimization
-ray[default]==2.36.0       # Distributed training/tuning support
+threadpoolctl==3.5.0
+lightgbm==4.5.0
+optuna==3.6.1
+colorlog==6.9.0
+packaging==24.1
+PyYAML==6.0.2
+ray[default]==2.36.0
+grpcio==1.66.2
+protobuf==4.25.3   # ✅ universal stable version (compatible with Ray, MLflow, WandB, TensorBoard, and Google APIs)
+click==8.1.7
 
-##############################
+
+# ===============================
+# PyTorch Core (manually installed)
+# ===============================
+# NOTE:
+# torch / torchvision / torchaudio are already installed manually for macOS ARM
+# Keep them pinned outside pip install to avoid platform-specific wheel issues.
+# torch==2.4.1
+# torchvision==0.19.1
+# torchaudio==2.4.1
+# triton==3.0.0   # CUDA-only; skip on macOS ARM
+
+
+# ===============================
 # Reinforcement Learning (RL)
-##############################
-torch==2.4.1
-torchvision==0.19.1
+# ===============================
+
+sympy==1.13.3
+filelock==3.16.1
+jinja2==3.1.4
 gymnasium==0.29.1
+cloudpickle==3.1.0
 stable-baselines3==2.3.2
 mlflow==2.17.1
+sqlparse==0.5.1
 wandb==0.18.4
+setproctitle==1.3.4
 tensorboard==2.18.0
-protobuf==5.28.2
+markdown==3.7
+werkzeug==3.0.4
+absl-py==2.1.0
 
-##############################
-# Monitoring & Observability
-##############################
+# ===============================
+# Monitoring & Observability (Python 3.11 Compatible)
+# ===============================
 prometheus-client==0.21.0
 influxdb==5.3.2
 statsd==4.0.1
-jaeger-client==4.9.0
+jaeger-client==4.8.0
+thrift==0.20.0
+
+# OpenTelemetry stack
 opentelemetry-api==1.27.0
 opentelemetry-sdk==1.27.0
-opentelemetry-exporter-jaeger==1.27.0
-opentelemetry-instrumentation-fastapi==0.48b0
+opentelemetry-exporter-jaeger==1.21.0
 opentelemetry-exporter-prometheus==0.48b0
+opentelemetry-instrumentation-fastapi==0.48b0
 
-##############################
+# ===============================
 # Security & Auth
-##############################
+# ===============================
 passlib[bcrypt]==1.7.4
+bcrypt==4.2.1
 pyjwt[crypto]==2.10.0
 cryptography==43.0.3
 python-jose==3.3.0
+rsa==4.9
+ecdsa==0.19.0
 itsdangerous==2.2.0
 
-##############################
-# Utility & Common Libraries
-##############################
+# ===============================
+# Utilities
+# ===============================
 tqdm==4.67.0
 colorama==0.4.6
 humanize==4.11.0
 schedule==1.2.2
 psutil==6.0.0
 aiofiles==24.1.0
-pyyaml==6.0.2
 rich==13.9.2
-click==8.1.7
-filelock==3.16.1
 tomlkit==0.13.2
+platformdirs==4.3.3
+requests==2.32.3
+certifi==2024.8.30
 
-##############################
-# Testing & Quality Assurance
-##############################
+# ===============================
+# Testing & QA
+# ===============================
 pytest==8.3.3
 pytest-asyncio==0.23.8
 pytest-cov==6.0.0
@@ -126,30 +163,43 @@ mypy==1.12.0
 isort==5.13.2
 bandit==1.8.2
 
-##############################
+# ===============================
 # Deployment & DevOps
-##############################
+# ===============================
 docker==7.1.0
 kubernetes==30.1.0
 helm-charts==1.0.2
 fabric==3.2.2
+paramiko==3.5.0
+bcrypt==4.2.1
 gunicorn==23.0.0
 supervisor==4.2.5
 
-##############################
-# Simulation & Experimentation
-##############################
+# ===============================
+# Simulation & Visualization
+# ===============================
 matplotlib==3.9.2
+contourpy==1.3.0
+cycler==0.12.1
+fonttools==4.54.1
+kiwisolver==1.4.7
+pillow==11.0.0
 seaborn==0.13.2
 plotly==5.24.1
-scipy==1.14.1
+tenacity==9.0.0
 faker==33.1.0
 networkx==3.4.2
 
-##############################
-# Optional - Cloud Integrations
-##############################
+# ===============================
+# Cloud & Optional
+# ===============================
 google-cloud-storage==2.18.2
+google-auth==2.35.0
+google-api-core==2.20.0
+google-resumable-media==2.7.2
 azure-storage-blob==12.23.1
+azure-core==1.32.0
 snowflake-connector-python==3.13.2
-requests==2.32.3
+pyarrow==17.0.0
+cffi==1.17.1
+websocket-client==1.8.0

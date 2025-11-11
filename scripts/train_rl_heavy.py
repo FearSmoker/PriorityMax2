@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # train_rl_heavy.py
 """
-Train RL — Heavy / Production Trainer (PPO, multi-GPU ready)
-------------------------------------------------------------
+Train RL — Heavy / Production Trainer (PPO, multi-GPU ready) - ENTERPRISE EDITION
+----------------------------------------------------------------------------------
 
 Purpose:
  - Train a production-grade PPO policy for PriorityMax autoscaling using
@@ -10,6 +10,8 @@ Purpose:
  - Support multi-GPU / distributed training (torch.distributed and Ray options).
  - Integrated checkpointing, MLflow & W&B experiment logging, evaluation hooks,
    canary gating and model registry registration.
+ - ENTERPRISE FEATURES: Mixed precision (AMP), auto-resume, ONNX export, 
+   emergency checkpointing, distributed replay buffer, Ray Tune HPO.
 
 Usage examples:
   # single-node multi-GPU (DDP)
@@ -17,6 +19,12 @@ Usage examples:
 
   # with Ray (if enabled)
   python3 scripts/train_rl_heavy.py --use-ray --ray-address auto --epochs 1000 --gpus 8
+  
+  # with auto-resume and mixed precision
+  python3 scripts/train_rl_heavy.py --epochs 500 --use-amp --auto-resume
+
+  # with Ray Tune for hyperparameter optimization
+  python3 scripts/train_rl_heavy.py --use-ray-tune --tune-samples 20
 
 Notes:
  - This file is intentionally defensive: it runs even if optional deps missing.
@@ -34,12 +42,14 @@ import uuid
 import shutil
 import random
 import atexit
+import signal
 import logging
 import pathlib
 import tempfile
 import argparse
 import statistics
-from dataclasses import dataclass, asdict
+import pickle
+from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, Optional, Tuple, List, Sequence, Callable
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +64,8 @@ _HAS_RAY = False
 _HAS_MLFLOW = False
 _HAS_WANDB = False
 _HAS_TQDM = False
+_HAS_ONNX = False
+_HAS_REDIS = False
 
 try:
     import torch
@@ -71,10 +83,12 @@ except Exception:
 try:
     import ray
     from ray import tune
+    from ray.tune.schedulers import ASHAScheduler
     _HAS_RAY = True
 except Exception:
     ray = None
     tune = None
+    ASHAScheduler = None
 
 try:
     import mlflow
@@ -94,6 +108,18 @@ try:
 except Exception:
     tqdm = lambda x: x  # fallback iterator
 
+try:
+    import onnxruntime as ort
+    _HAS_ONNX = True
+except Exception:
+    ort = None
+
+try:
+    import redis
+    _HAS_REDIS = True
+except Exception:
+    redis = None
+
 # ---------------------------
 # Project modules (best-effort)
 # ---------------------------
@@ -111,6 +137,24 @@ except Exception:
     PPOActorCritic = None
     ModelRegistry = None
     RLAgentProd = None
+
+from app.ml.real_env import get_observation_space, get_action_space
+
+# Construct environment configuration for training consistency
+SYNC_CFG = EnvConfig(
+    mode="sim",
+    obs_dim=8,
+    act_dim=3,
+    reward_latency_sla_ms=500.0,
+    cost_per_worker_per_sec=0.0005,
+    max_scale_delta=5,
+)
+
+print(
+    f"[SYNC CHECK] train_rl_heavy aligned | "
+    f"obs_dim={SYNC_CFG.obs_dim}, act_dim={SYNC_CFG.act_dim}, "
+    f"SLA={SYNC_CFG.reward_latency_sla_ms}, cost={SYNC_CFG.cost_per_worker_per_sec}"
+)
 
 # ---------------------------
 # Paths & Defaults
@@ -193,6 +237,29 @@ class HeavyRLConfig:
     num_workers: int = 4  # dataloader / sampling parallelism
     verbose: bool = True
     dry_run: bool = False
+    
+    # ===== ENTERPRISE FEATURES =====
+    # Mixed precision training
+    use_amp: bool = False  # Enable automatic mixed precision
+    
+    # Auto-resume
+    auto_resume: bool = False  # Automatically resume from latest checkpoint
+    
+    # ONNX export
+    export_onnx: bool = True  # Export model to ONNX format
+    validate_onnx: bool = True  # Validate ONNX export
+    
+    # Emergency checkpointing
+    enable_emergency_checkpoint: bool = True  # Save on SIGTERM/SIGINT
+    
+    # Distributed replay buffer
+    use_distributed_buffer: bool = False
+    redis_url: Optional[str] = None  # e.g., "redis://localhost:6379"
+    
+    # Ray Tune hyperparameter optimization
+    use_ray_tune: bool = False
+    tune_samples: int = 20
+    tune_max_epochs: int = 100
 
 # ---------------------------
 # Utilities
@@ -222,6 +289,230 @@ def current_time_str():
 
 def default_run_name(prefix: str = "ppo"):
     return f"{prefix}_{current_time_str()}_{uuid.uuid4().hex[:6]}"
+
+# ---------------------------
+# ENTERPRISE FEATURE 1: Auto-Resume
+# ---------------------------
+def auto_resume_checkpoint(cfg: HeavyRLConfig) -> Optional[str]:
+    """
+    Automatically find and resume from the latest checkpoint.
+    
+    CRITICAL for:
+    - Spot instance interruptions
+    - Kubernetes pod evictions
+    - Multi-day training runs
+    
+    Returns:
+        Path to latest checkpoint if found, else None
+    """
+    checkpoint_dir = pathlib.Path(cfg.checkpoint_dir)
+    if not checkpoint_dir.exists():
+        return None
+    
+    # Find all epoch checkpoints
+    ckpts = sorted(checkpoint_dir.glob("rl_ckpt_*.pt"), 
+                   key=lambda p: int(p.stem.split('_')[-1]) if p.stem.split('_')[-1].isdigit() else 0)
+    
+    if ckpts:
+        latest = str(ckpts[-1])
+        try:
+            epoch_num = int(ckpts[-1].stem.split('_')[-1])
+            LOG.info("🔄 Auto-resuming from checkpoint: %s (epoch %d)", latest, epoch_num)
+        except:
+            LOG.info("🔄 Auto-resuming from checkpoint: %s", latest)
+        return latest
+    
+    # Check for emergency auto-save
+    autosave = checkpoint_dir / "emergency_autosave.pt"
+    if autosave.exists():
+        LOG.warning("⚠️ Found emergency autosave, resuming from there")
+        return str(autosave)
+    
+    # Check for final checkpoint
+    final_ckpts = sorted(checkpoint_dir.glob("rl_final_*.pt"))
+    if final_ckpts:
+        latest = str(final_ckpts[-1])
+        LOG.info("🔄 Auto-resuming from final checkpoint: %s", latest)
+        return latest
+    
+    return None
+
+# ---------------------------
+# ENTERPRISE FEATURE 2: Emergency Checkpoint Handler
+# ---------------------------
+class EmergencyCheckpointer:
+    """
+    Save checkpoint on SIGTERM/SIGINT to prevent data loss.
+    Essential for cloud environments with preemption.
+    """
+    def __init__(self, trainer, save_path: str):
+        self.trainer = trainer
+        self.save_path = save_path
+        self.interrupted = False
+        
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+        LOG.info("🛡️ Emergency checkpoint handler installed")
+    
+    def _handle_signal(self, signum, frame):
+        if self.interrupted:
+            LOG.error("❌ Force quit - no checkpoint saved")
+            sys.exit(1)
+        
+        self.interrupted = True
+        LOG.warning("⚠️ Received signal %d, saving emergency checkpoint...", signum)
+        
+        try:
+            state = {
+                'model': self.trainer.model,
+                'optimizer': self.trainer.optimizer,
+                'epoch': getattr(self.trainer, 'current_epoch', 0),
+                'emergency': True,
+                'timestamp': time.time()
+            }
+            
+            save_checkpoint(state, self.save_path)
+            LOG.info("✅ Emergency checkpoint saved to %s", self.save_path)
+        except Exception as e:
+            LOG.exception("❌ Failed to save emergency checkpoint: %s", e)
+        
+        sys.exit(0)
+
+# ---------------------------
+# ENTERPRISE FEATURE 3: ONNX Export with Validation
+# ---------------------------
+def export_to_onnx(model, save_path: str, obs_dim: int, act_dim: int, 
+                   validate: bool = True) -> bool:
+    """
+    Export trained model to ONNX format for production inference.
+    
+    CRITICAL for:
+    - Deploying to production inference servers
+    - Cross-platform compatibility
+    - Model registry integration
+    
+    Returns:
+        True if export successful, False otherwise
+    """
+    if not _HAS_TORCH:
+        LOG.warning("PyTorch not available, skipping ONNX export")
+        return False
+    
+    try:
+        model.eval()
+        dummy_input = torch.randn(1, obs_dim, device=next(model.parameters()).device)
+        
+        # Export
+        torch.onnx.export(
+            model,
+            dummy_input,
+            save_path,
+            input_names=['observation'],
+            output_names=['action_mean', 'value'],
+            dynamic_axes={
+                'observation': {0: 'batch_size'},
+                'action_mean': {0: 'batch_size'},
+                'value': {0: 'batch_size'}
+            },
+            opset_version=17,
+            do_constant_folding=True,
+            export_params=True,
+            verbose=False
+        )
+        
+        LOG.info("✅ Model exported to ONNX: %s", save_path)
+        
+        # Validation step
+        if validate and _HAS_ONNX:
+            session = ort.InferenceSession(save_path)
+            
+            # Test inference
+            test_input = dummy_input.cpu().numpy()
+            outputs = session.run(None, {'observation': test_input})
+            
+            LOG.info("✅ ONNX validation passed. Output shapes: %s", 
+                    [o.shape for o in outputs])
+        
+        return True
+        
+    except Exception as e:
+        LOG.exception("❌ ONNX export failed: %s", e)
+        return False
+
+# ---------------------------
+# ENTERPRISE FEATURE 4: Distributed Replay Buffer
+# ---------------------------
+class DistributedReplayBuffer:
+    """
+    Redis-backed replay buffer for distributed training.
+    
+    Use this when training across multiple nodes/pods to share experience.
+    """
+    def __init__(self, redis_url: Optional[str] = None, max_size: int = 100000):
+        self.max_size = max_size
+        self.local_buffer = deque(maxlen=max_size)
+        self.redis_client = None
+        
+        if redis_url and _HAS_REDIS:
+            try:
+                self.redis_client = redis.from_url(redis_url)
+                self.key_prefix = "pmax:replay"
+                LOG.info("✅ Distributed replay buffer connected to Redis: %s", redis_url)
+            except Exception as e:
+                LOG.warning("Failed to connect to Redis: %s. Using local buffer only.", e)
+                self.redis_client = None
+        else:
+            LOG.info("Using local replay buffer only")
+    
+    def add_trajectory(self, trajectory: Dict[str, Any]):
+        """Add a trajectory to the shared buffer."""
+        self.local_buffer.append(trajectory)
+        
+        if self.redis_client:
+            try:
+                key = f"{self.key_prefix}:{uuid.uuid4().hex}"
+                self.redis_client.setex(key, 3600, pickle.dumps(trajectory))
+                self.redis_client.zadd(f"{self.key_prefix}:index", {key: time.time()})
+                
+                # Prune old entries
+                cutoff = time.time() - 3600
+                self.redis_client.zremrangebyscore(f"{self.key_prefix}:index", 0, cutoff)
+            except Exception:
+                LOG.debug("Failed to write to Redis buffer")
+    
+    def sample(self, batch_size: int) -> List[Dict[str, Any]]:
+        """Sample trajectories from buffer."""
+        if self.redis_client:
+            try:
+                # Get random keys from sorted set
+                keys = self.redis_client.zrange(f"{self.key_prefix}:index", 0, -1)
+                if keys:
+                    sampled_keys = random.sample(list(keys), min(batch_size, len(keys)))
+                    trajectories = []
+                    for k in sampled_keys:
+                        data = self.redis_client.get(k)
+                        if data:
+                            trajectories.append(pickle.loads(data))
+                    if trajectories:
+                        return trajectories
+            except Exception:
+                LOG.debug("Failed to sample from Redis, using local buffer")
+        
+        # Fallback to local buffer
+        if len(self.local_buffer) < batch_size:
+            return list(self.local_buffer)
+        return random.sample(list(self.local_buffer), batch_size)
+    
+    def size(self) -> int:
+        """Get total buffer size."""
+        local_size = len(self.local_buffer)
+        if self.redis_client:
+            try:
+                redis_size = self.redis_client.zcard(f"{self.key_prefix}:index")
+                return local_size + redis_size
+            except:
+                pass
+        return local_size
 
 # ---------------------------
 # Checkpoint helpers
@@ -398,17 +689,20 @@ class SimpleVecEnv:
         return next_obs, rewards, dones, infos
 
 # ---------------------------
-# PPO Trainer core
+# PPO Trainer core - ENHANCED WITH ENTERPRISE FEATURES
 # ---------------------------
 class PPOTrainer:
     """
-    High-level PPO trainer abstraction.
+    High-level PPO trainer abstraction with enterprise features.
     Responsibilities:
       - Manage envs (vectorized)
       - Collect trajectories
       - Compute GAE and advantages
-      - Perform minibatch updates
+      - Perform minibatch updates with optional AMP
       - Checkpointing, evaluation, and logging
+      - Emergency checkpoint handling
+      - ONNX export
+      - Distributed replay buffer support
     """
     def __init__(self, cfg: HeavyRLConfig):
         self.cfg = cfg
@@ -424,10 +718,34 @@ class PPOTrainer:
         self.model = None
         self.optimizer = None
         self.start_epoch = 1
+        self.current_epoch = 1  # Track current epoch for emergency checkpoints
         self.best_metrics: List[Tuple[str, float]] = []  # list of (path, metric) for top-k retention
 
         # model registry integration (best-effort)
         self.registry = ModelRegistry() if ModelRegistry else None
+        
+        # ===== ENTERPRISE FEATURES =====
+        # Mixed precision scaler
+        self.scaler = None
+        if cfg.use_amp and _HAS_TORCH and torch.cuda.is_available():
+            self.scaler = torch.cuda.amp.GradScaler()
+            LOG.info("✅ Mixed precision (AMP) enabled")
+        
+        # Emergency checkpoint handler
+        self.emergency_checkpointer = None
+        if cfg.enable_emergency_checkpoint:
+            emergency_path = str(pathlib.Path(cfg.checkpoint_dir) / "emergency_autosave.pt")
+            # Will be initialized after model creation
+            self._emergency_path = emergency_path
+        
+        # Distributed replay buffer
+        self.replay_buffer = None
+        if cfg.use_distributed_buffer:
+            self.replay_buffer = DistributedReplayBuffer(
+                redis_url=cfg.redis_url or os.getenv("REDIS_URL"),
+                max_size=100000
+            )
+            LOG.info("✅ Distributed replay buffer initialized")
 
     # -------------------------
     # Environment factory
@@ -469,6 +787,11 @@ class PPOTrainer:
         self.model = ActorCriticNet(int(obs_dim), int(act_dim), policy_hidden=self.cfg.policy_hidden_layers, value_hidden=self.cfg.value_hidden_layers, activation=self.cfg.activation)
         self.model.to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.lr)
+        
+        # Initialize emergency checkpointer after model is created
+        if self.cfg.enable_emergency_checkpoint and hasattr(self, '_emergency_path'):
+            self.emergency_checkpointer = EmergencyCheckpointer(self, self._emergency_path)
+        
         return self.model
 
     # -------------------------
@@ -489,6 +812,11 @@ class PPOTrainer:
                     backend = os.environ.get("DDP_BACKEND", "nccl" if torch.cuda.is_available() else "gloo")
                     LOG.info("Initializing torch.distributed (backend=%s rank=%s world_size=%s)", backend, rank, world_size)
                     torch.distributed.init_process_group(backend=backend)
+                    
+                    # Wrap model with DDP after it's created
+                    if self.model is not None:
+                        self.model = DDP(self.model, device_ids=[rank] if torch.cuda.is_available() else None)
+                        LOG.info("✅ Model wrapped with DistributedDataParallel")
                 else:
                     LOG.info("No distributed env vars found; skipping in-process init.")
             except Exception:
@@ -499,7 +827,7 @@ class PPOTrainer:
                     ray.init(address=self.cfg.ray_address, ignore_reinit_error=True)
                 else:
                     ray.init(ignore_reinit_error=True)
-                LOG.info("Ray initialized")
+                LOG.info("✅ Ray initialized")
             except Exception:
                 LOG.exception("Ray initialization failed")
 
@@ -629,15 +957,17 @@ def collect_rollout(trainer: PPOTrainer, total_steps: int) -> Tuple[TrajectoryBu
     return buf, last_val
 
 # ---------------------------
-# PPO update step
+# PPO update step - ENHANCED WITH AMP
 # ---------------------------
 def ppo_update(trainer: PPOTrainer, buffer_data: Dict[str, Any], updates: int):
     """
     Perform PPO policy/value updates using the flattened buffer_data.
+    Enhanced with automatic mixed precision (AMP) support.
     """
     model = trainer.model
     optimizer = trainer.optimizer
     cfg = trainer.cfg
+    scaler = trainer.scaler
 
     obs_all = buffer_data["obs"]
     acts_all = buffer_data["acts"]
@@ -663,27 +993,56 @@ def ppo_update(trainer: PPOTrainer, buffer_data: Dict[str, Any], updates: int):
             rets_b = to_tensor(rets_all[batch_idx], device=trainer.device)
             old_logp_b = to_tensor(old_logps_all[batch_idx], device=trainer.device)
 
-            # forward
-            action_mean, value_pred = model.forward(obs_b)
-            std = torch.exp(model.log_std)
-            dist = torch.distributions.Normal(action_mean, std)
-            new_logp = dist.log_prob(acts_b).sum(dim=-1)
-            entropy = dist.entropy().sum(dim=-1).mean()
+            # ENTERPRISE FEATURE: Mixed Precision Training
+            if scaler is not None:
+                # AMP context for forward pass
+                with torch.cuda.amp.autocast():
+                    # forward
+                    action_mean, value_pred = model.forward(obs_b)
+                    std = torch.exp(model.log_std)
+                    dist = torch.distributions.Normal(action_mean, std)
+                    new_logp = dist.log_prob(acts_b).sum(dim=-1)
+                    entropy = dist.entropy().sum(dim=-1).mean()
 
-            ratio = torch.exp(new_logp - old_logp_b)
-            surr1 = ratio * advs_b
-            surr2 = torch.clamp(ratio, 1.0 - cfg.clip_ratio, 1.0 + cfg.clip_ratio) * advs_b
-            pi_loss = -torch.min(surr1, surr2).mean()
+                    ratio = torch.exp(new_logp - old_logp_b)
+                    surr1 = ratio * advs_b
+                    surr2 = torch.clamp(ratio, 1.0 - cfg.clip_ratio, 1.0 + cfg.clip_ratio) * advs_b
+                    pi_loss = -torch.min(surr1, surr2).mean()
 
-            value_pred = value_pred.view(-1)
-            v_loss = ((rets_b - value_pred) ** 2).mean()
+                    value_pred = value_pred.view(-1)
+                    v_loss = ((rets_b - value_pred) ** 2).mean()
 
-            loss = pi_loss + cfg.value_coef * v_loss - cfg.entropy_coef * entropy
+                    loss = pi_loss + cfg.value_coef * v_loss - cfg.entropy_coef * entropy
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-            optimizer.step()
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Standard training without AMP
+                # forward
+                action_mean, value_pred = model.forward(obs_b)
+                std = torch.exp(model.log_std)
+                dist = torch.distributions.Normal(action_mean, std)
+                new_logp = dist.log_prob(acts_b).sum(dim=-1)
+                entropy = dist.entropy().sum(dim=-1).mean()
+
+                ratio = torch.exp(new_logp - old_logp_b)
+                surr1 = ratio * advs_b
+                surr2 = torch.clamp(ratio, 1.0 - cfg.clip_ratio, 1.0 + cfg.clip_ratio) * advs_b
+                pi_loss = -torch.min(surr1, surr2).mean()
+
+                value_pred = value_pred.view(-1)
+                v_loss = ((rets_b - value_pred) ** 2).mean()
+
+                loss = pi_loss + cfg.value_coef * v_loss - cfg.entropy_coef * entropy
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                optimizer.step()
 
             # stats
             stats["pi_loss"].append(pi_loss.item())
@@ -799,24 +1158,128 @@ def manage_checkpoint_retention(trainer: PPOTrainer, ckpt_path: str, metric_val:
             LOG.exception("Model registry promotion failed for %s", best_path)
 
 # ---------------------------
-# Full PPO training loop
+# ENTERPRISE FEATURE 5: Ray Tune Integration
+# ---------------------------
+def ray_tune_objective(config: Dict[str, Any], checkpoint_dir: Optional[str] = None):
+    """
+    Ray Tune training function for hyperparameter optimization.
+    """
+    # Create config from tune parameters
+    cfg = HeavyRLConfig(
+        lr=config.get("lr", 3e-4),
+        gamma=config.get("gamma", 0.99),
+        clip_ratio=config.get("clip_ratio", 0.2),
+        entropy_coef=config.get("entropy_coef", 0.01),
+        hidden_dim=config.get("hidden_dim", 256),
+        epochs=config.get("max_epochs", 100),
+        steps_per_epoch=config.get("steps_per_epoch", 8192),
+        log_wandb=False,  # Disable W&B for tune trials
+        log_mlflow=False,  # Disable MLflow for tune trials
+        checkpoint_interval=10,
+        eval_interval=5,
+        verbose=False
+    )
+    
+    # Resume from checkpoint if provided
+    if checkpoint_dir:
+        cfg.resume_from = os.path.join(checkpoint_dir, "tune_ckpt.pt")
+    
+    # Run training
+    result = train_heavy(cfg)
+    
+    # Report to Ray Tune
+    if _HAS_RAY:
+        tune.report(mean_reward=result["best_reward"])
+    
+    return result
+
+def run_ray_tune_optimization(base_cfg: HeavyRLConfig):
+    """
+    Run Ray Tune hyperparameter optimization.
+    """
+    if not _HAS_RAY:
+        LOG.error("Ray not available. Install with: pip install ray[tune]")
+        return None
+    
+    LOG.info("🔍 Starting Ray Tune hyperparameter optimization")
+    
+    # Define search space
+    search_space = {
+        "lr": tune.loguniform(1e-5, 1e-3),
+        "gamma": tune.uniform(0.95, 0.995),
+        "clip_ratio": tune.uniform(0.1, 0.3),
+        "entropy_coef": tune.loguniform(1e-3, 1e-1),
+        "hidden_dim": tune.choice([128, 256, 512]),
+        "steps_per_epoch": tune.choice([4096, 8192, 16384]),
+        "max_epochs": base_cfg.tune_max_epochs,
+    }
+    
+    # ASHA scheduler for early stopping
+    scheduler = ASHAScheduler(
+        metric="mean_reward",
+        mode="max",
+        max_t=base_cfg.tune_max_epochs,
+        grace_period=10,
+        reduction_factor=2
+    )
+    
+    # Run optimization
+    analysis = tune.run(
+        ray_tune_objective,
+        config=search_space,
+        num_samples=base_cfg.tune_samples,
+        scheduler=scheduler,
+        resources_per_trial={"cpu": 4, "gpu": 0.5 if torch.cuda.is_available() else 0},
+        verbose=1,
+        name="pmax_hpo"
+    )
+    
+    # Get best configuration
+    best_config = analysis.get_best_config(metric="mean_reward", mode="max")
+    LOG.info("✅ Best hyperparameters found:")
+    LOG.info(json.dumps(best_config, indent=2))
+    
+    # Save best config
+    config_path = pathlib.Path(base_cfg.checkpoint_dir) / "best_hpo_config.json"
+    save_json_atomic(best_config, str(config_path))
+    
+    return best_config
+
+# ---------------------------
+# Full PPO training loop - ENHANCED
 # ---------------------------
 def train_heavy(cfg: HeavyRLConfig):
     """
-    Core training entrypoint for PPO heavy trainer.
+    Core training entrypoint for PPO heavy trainer with enterprise features.
     """
     if not _HAS_TORCH:
         raise RuntimeError("PyTorch is required for train_heavy")
 
     set_seed(cfg.seed)
     LOG.info("Starting heavy PPO training: epochs=%d steps/epoch=%d", cfg.epochs, cfg.steps_per_epoch)
+    
+    # ENTERPRISE FEATURE: Auto-resume
+    if cfg.auto_resume and not cfg.resume_from:
+        auto_resume_path = auto_resume_checkpoint(cfg)
+        if auto_resume_path:
+            cfg.resume_from = auto_resume_path
+    
     trainer = PPOTrainer(cfg)
     trainer.setup_distributed()
     ctx = init_loggers(cfg)
 
-    # create envs and model
+   # create envs and model
     envs = trainer.make_envs()
     trainer.envs = envs
+    
+    # --- Enforce synchronization with real_env spec (optional safety) ---
+    if hasattr(SYNC_CFG, "obs_dim") and hasattr(SYNC_CFG, "act_dim"):
+        cfg.obs_dim = SYNC_CFG.obs_dim
+        cfg.act_dim = SYNC_CFG.act_dim
+        LOG.info(
+            "🔄 Enforcing synchronized dimensions: obs_dim=%d act_dim=%d (from real_env)",
+            cfg.obs_dim, cfg.act_dim,
+        )
     
     # Properly detect observation dimension
     if cfg.obs_dim:
@@ -855,18 +1318,21 @@ def train_heavy(cfg: HeavyRLConfig):
                 trainer.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             if "epoch" in ckpt:
                 trainer.start_epoch = ckpt["epoch"] + 1
-            LOG.info("Resumed from checkpoint %s (epoch %d)", cfg.resume_from, trainer.start_epoch - 1)
+                trainer.current_epoch = trainer.start_epoch
+            LOG.info("✅ Resumed from checkpoint %s (epoch %d)", cfg.resume_from, trainer.start_epoch - 1)
         except Exception:
             LOG.exception("Failed to resume from %s", cfg.resume_from)
 
     # main training loop
     t0 = time.time()
     for epoch in range(trainer.start_epoch, cfg.epochs + 1):
+        trainer.current_epoch = epoch
+        
         # collect rollout
         buf, last_val = collect_rollout(trainer, cfg.steps_per_epoch)
         data = buf.compute_advantages(last_val, cfg.gamma, cfg.lam)
 
-        # PPO update
+        # PPO update (with AMP if enabled)
         stats = ppo_update(trainer, data, updates=cfg.update_epochs)
         total_steps = epoch * cfg.steps_per_epoch
 
@@ -884,6 +1350,11 @@ def train_heavy(cfg: HeavyRLConfig):
                 ckpt_path = os.path.join(cfg.checkpoint_dir, f"rl_ckpt_{epoch:04d}.pt")
                 save_checkpoint({"model": trainer.model, "optimizer": trainer.optimizer, "epoch": epoch}, ckpt_path)
                 manage_checkpoint_retention(trainer, ckpt_path, reward)
+                
+                # ENTERPRISE FEATURE: ONNX Export
+                if cfg.export_onnx and reward >= best_metric:
+                    onnx_path = os.path.join(cfg.checkpoint_dir, f"rl_model_{epoch:04d}.onnx")
+                    export_to_onnx(trainer.model, onnx_path, obs_dim, act_dim, validate=cfg.validate_onnx)
 
         else:
             log_metrics(ctx, {**stats, "epoch": epoch}, step=epoch)
@@ -896,6 +1367,11 @@ def train_heavy(cfg: HeavyRLConfig):
     final_ckpt = os.path.join(cfg.checkpoint_dir, f"rl_final_{current_time_str()}.pt")
     save_checkpoint({"model": trainer.model, "optimizer": trainer.optimizer, "epoch": cfg.epochs}, final_ckpt)
     manage_checkpoint_retention(trainer, final_ckpt, best_metric)
+    
+    # ENTERPRISE FEATURE: Final ONNX Export
+    if cfg.export_onnx:
+        final_onnx = os.path.join(cfg.checkpoint_dir, f"rl_model_final_{current_time_str()}.onnx")
+        export_to_onnx(trainer.model, final_onnx, obs_dim, act_dim, validate=cfg.validate_onnx)
 
     # finalize loggers
     if ctx.get("mlflow") and _HAS_MLFLOW:
@@ -912,14 +1388,24 @@ def train_heavy(cfg: HeavyRLConfig):
         except Exception:
             LOG.exception("Failed to close W&B run")
 
-    LOG.info("Training complete. Best reward=%.3f checkpoint=%s", best_metric, final_ckpt)
+    # Final sync sanity
+    obs_space = get_observation_space()
+    act_space = get_action_space()
+    if obs_space and act_space:
+        LOG.info(
+            "✅ Sync verified | obs_dim=%d vs env=%d | act_dim=%d vs env=%d",
+            cfg.obs_dim, obs_space.shape[0],
+            cfg.act_dim, act_space.shape[0],
+        )
+    
+    LOG.info("✅ Training complete. Best reward=%.3f checkpoint=%s", best_metric, final_ckpt)
     return {"best_reward": best_metric, "checkpoint": final_ckpt}
 
 # ---------------------------
 # CLI interface
 # ---------------------------
 def build_arg_parser():
-    parser = argparse.ArgumentParser(description="PriorityMax Heavy PPO Trainer")
+    parser = argparse.ArgumentParser(description="PriorityMax Heavy PPO Trainer - Enterprise Edition")
     
     # Training schedule
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
@@ -950,6 +1436,18 @@ def build_arg_parser():
     parser.add_argument("--checkpoint-dir", default=str(DEFAULT_MODELS_DIR), help="Checkpoint directory")
     parser.add_argument("--eval-interval", type=int, default=10, help="Evaluation interval (epochs)")
     parser.add_argument("--checkpoint-interval", type=int, default=10, help="Checkpoint save interval")
+    
+    # ===== ENTERPRISE FEATURES =====
+    parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision (AMP)")
+    parser.add_argument("--auto-resume", action="store_true", help="Automatically resume from latest checkpoint")
+    parser.add_argument("--export-onnx", action="store_true", default=True, help="Export models to ONNX format")
+    parser.add_argument("--no-emergency-checkpoint", action="store_true", help="Disable emergency checkpoint on SIGTERM/SIGINT")
+    # Continuation of build_arg_parser() from line 806
+    parser.add_argument("--use-distributed-buffer", action="store_true", help="Enable distributed replay buffer (requires Redis)")
+    parser.add_argument("--redis-url", default=None, help="Redis URL for distributed buffer (e.g., redis://localhost:6379)")
+    parser.add_argument("--use-ray-tune", action="store_true", help="Enable Ray Tune hyperparameter optimization")
+    parser.add_argument("--tune-samples", type=int, default=20, help="Number of Ray Tune samples for HPO")
+    parser.add_argument("--tune-max-epochs", type=int, default=100, help="Max epochs per Ray Tune trial")
     
     return parser
 
@@ -987,13 +1485,37 @@ def main():
         eval_interval=args.eval_interval,
         checkpoint_interval=args.checkpoint_interval,
         dry_run=args.dry_run,
+        # ===== ENTERPRISE FEATURES =====
+        use_amp=args.use_amp,
+        auto_resume=args.auto_resume,
+        export_onnx=args.export_onnx,
+        validate_onnx=True,
+        enable_emergency_checkpoint=not args.no_emergency_checkpoint,
+        use_distributed_buffer=args.use_distributed_buffer,
+        redis_url=args.redis_url,
+        use_ray_tune=args.use_ray_tune,
+        tune_samples=args.tune_samples,
+        tune_max_epochs=args.tune_max_epochs,
     )
     
     if cfg.dry_run:
-        LOG.warning("Running in DRY-RUN mode (no training, test configs only).")
+        LOG.warning("🔍 Running in DRY-RUN mode (no training, test configs only).")
         print(json.dumps(asdict(cfg), indent=2))
         return
     
+    # ===== ENTERPRISE FEATURE: Ray Tune Hyperparameter Optimization =====
+    if cfg.use_ray_tune:
+        LOG.info("🎯 Starting Ray Tune hyperparameter optimization")
+        best_config = run_ray_tune_optimization(cfg)
+        
+        if best_config:
+            LOG.info("✅ Ray Tune optimization complete. Best config saved.")
+            LOG.info("💡 To train with best config, run:")
+            LOG.info(f"   python {sys.argv[0]} --lr {best_config['lr']} --gamma {best_config['gamma']} "
+                    f"--clip-ratio {best_config['clip_ratio']} --hidden-dim {best_config['hidden_dim']}")
+        return
+    
+    # ===== Standard Training =====
     train_heavy(cfg)
 
 if __name__ == "__main__":

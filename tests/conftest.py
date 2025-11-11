@@ -85,7 +85,7 @@ def event_loop():
 # -----------------------------------------------------------------------------
 # MLflow + WandB Stub Fixtures
 # -----------------------------------------------------------------------------
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="function", autouse=True)
 def stub_mlflow(monkeypatch):
     """
     Replace MLflow APIs with lightweight in-memory stubs.
@@ -111,7 +111,7 @@ def stub_mlflow(monkeypatch):
     monkeypatch.setitem(sys.modules, "mlflow", stub)
     return stub
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="function", autouse=True)
 def stub_wandb(monkeypatch):
     """
     Replace WandB APIs with local mocks.
@@ -142,7 +142,7 @@ def stub_wandb(monkeypatch):
 # -----------------------------------------------------------------------------
 # Dummy boto3 stub (for S3 uploads in evaluation tests)
 # -----------------------------------------------------------------------------
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="function", autouse=True)
 def stub_boto3(monkeypatch):
     """
     Stub boto3 client to avoid AWS calls.

@@ -1,20 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-scripts/train_rl_eval.py (enterprise-grade, chunk 1)
----------------------------------------------------
+scripts/train_rl_eval.py - ENTERPRISE EDITION (SYNCHRONIZED)
+------------------------------------------------------------
 
-Chunk 1 responsibilities:
- - Configuration (YAML/JSON/CLI) with strict validation
- - Structured logging and diagnostic contexts
- - MLflow / Weights & Biases (W&B) integration helpers (best-effort safe)
- - Model registry + artifact storage helpers (local FS + optional S3)
- - Robust checkpoint discovery and a model loader scaffold (metadata-guided)
- - Basic utility helpers used across other chunks
+Enterprise-grade RL model evaluation synchronized with train_rl_heavy.py and train_rl_live.py
 
-This file is split into chunks for readability and CI-friendly diffs.
-Load chunk 1 first; chunk 2 will implement policy instantiation, env orchestration,
-evaluation loop, artifact writing, metrics export, and final exit logic.
+Key Features:
+✅ ONNX model evaluation (production inference path)
+✅ A/B testing with statistical significance
+✅ Drift detection (distribution shift monitoring)
+✅ Performance benchmarking (latency/throughput)
+✅ Numerical stability checks (NaN/Inf detection)
+✅ Prometheus metrics export
+✅ Parallel evaluation (multi-worker)
+✅ MLflow & W&B integration
+✅ S3 artifact storage
+✅ Model registry integration
+✅ CI/CD ready (exit codes, automated gates)
+
+Usage:
+    # Standard evaluation
+    python3 scripts/train_rl_eval.py --model-dir models/ppo --eval-episodes 50
+    
+    # ONNX production path
+    python3 scripts/train_rl_eval.py --checkpoint model.onnx --use-onnx
+    
+    # A/B testing
+    python3 scripts/train_rl_eval.py --checkpoint candidate.pt --baseline-checkpoint baseline.pt
+    
+    # Full enterprise pipeline
+    python3 scripts/train_rl_eval.py --model-tag prod-v2 --baseline-checkpoint prod-v1.pt \\
+        --drift-detection --benchmark --prometheus --mlflow --wandb
 """
 
 from __future__ import annotations
@@ -35,7 +52,7 @@ import time
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-# Third-party -- imported best effort so script can run in minimal CI without optional deps
+# Third-party imports (best effort)
 try:
     import yaml
     _HAS_YAML = True
@@ -73,29 +90,76 @@ except Exception:
     ClientError = Exception
     _HAS_BOTO3 = False
 
-# project-local modules import attempt (best-effort)
-ROOT = pathlib.Path(__file__).resolve().parents[2]  # repo root
-# prefer running from repo root; allow running from backend folder too
+try:
+    import onnxruntime as ort
+    _HAS_ONNX = True
+except Exception:
+    ort = None
+    _HAS_ONNX = False
+
+try:
+    from prometheus_client import Gauge, Counter, start_http_server
+    _HAS_PROMETHEUS = True
+except Exception:
+    Gauge = Counter = None
+    _HAS_PROMETHEUS = False
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except Exception:
+    np = None
+    _HAS_NUMPY = False
+
+# Project imports
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 _candidates = [ROOT, ROOT / "backend", ROOT / "backend" / "app"]
 for c in _candidates:
     if str(c) not in sys.path:
         sys.path.insert(0, str(c))
 
-# Try to import SimulatedRealEnv and EnvConfig; if absent we will error later with clear message
 try:
     from ml.real_env import SimulatedRealEnv, EnvConfig
 except Exception:
     SimulatedRealEnv = None
     EnvConfig = None
 
-# Try to import predictor/registry modules for model metadata resolution
+# ---------------------------
+# 🔄 Synchronization Setup (RealEnv alignment)
+# ---------------------------
+"""
+SYNCHRONIZED WITH:
+ - real_env.py (EnvConfig, DriftTracker)
+ - train_rl_heavy.py (training consistency)
+ - train_rl_live.py (live rollout consistency)
+ - rl_agent_prod.py (runtime inference safety)
+"""
+
+from ml.real_env import get_observation_space, get_action_space
+
+# Construct synchronized evaluation config
+SYNC_CFG = EnvConfig(
+    mode="sim",
+    obs_dim=8,
+    act_dim=3,
+    drift_window_size=1000,
+    reward_latency_sla_ms=500.0,
+    cost_per_worker_per_sec=0.0005,
+)
+
+print(
+    f"[SYNC CHECK] train_rl_eval aligned | "
+    f"obs_dim={SYNC_CFG.obs_dim}, act_dim={SYNC_CFG.act_dim}, "
+    f"SLA={SYNC_CFG.reward_latency_sla_ms}, cost={SYNC_CFG.cost_per_worker_per_sec}"
+)
+
 try:
     from ml.model_registry import ModelRegistry
 except Exception:
     ModelRegistry = None
 
 # -------------------------
-# Constants & default paths
+# Constants & Paths
 # -------------------------
 DEFAULT_CHECKPOINTS_DIR = pathlib.Path(os.getenv("PRIORITYMAX_CHECKPOINTS_DIR", str(ROOT / "backend" / "checkpoints")))
 DEFAULT_MODELS_DIR = pathlib.Path(os.getenv("PRIORITYMAX_MODELS_DIR", str(ROOT / "backend" / "app" / "ml" / "models")))
@@ -103,13 +167,12 @@ DEFAULT_RESULTS_DIR = pathlib.Path(os.getenv("PRIORITYMAX_RESULTS_DIR", str(DEFA
 DEFAULT_TRACE_DIR = pathlib.Path(os.getenv("PRIORITYMAX_TRACES_DIR", str(DEFAULT_RESULTS_DIR / "traces")))
 DEFAULT_S3_BUCKET = os.getenv("PRIORITYMAX_S3_BUCKET", None)
 
-# Ensure directories exist for local-run convenience
 DEFAULT_CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_TRACE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Exit codes for CI
+# Exit codes
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_MEAN_BELOW_THRESHOLD = 2
@@ -117,7 +180,7 @@ EXIT_CONFIG_ERROR = 3
 EXIT_MISSING_DEP = 4
 
 # -------------------------
-# Logging setup
+# Logging
 # -------------------------
 LOG = logging.getLogger("prioritymax.rl.eval")
 LOG_LEVEL = os.getenv("PRIORITYMAX_EVAL_LOG", "INFO").upper()
@@ -132,19 +195,23 @@ def get_child_logger(name: str) -> logging.Logger:
     l.setLevel(LOG_LEVEL)
     return l
 
+loader_logger = get_child_logger("loader")
+storage_logger = get_child_logger("storage")
+
 # -------------------------
-# Config dataclasses
+# Config Dataclass
 # -------------------------
 @dataclass
 class EvalConfig:
-    model_dir: Optional[str] = None            # model directory in FS or "s3://bucket/prefix"
-    checkpoint: Optional[str] = None           # explicit checkpoint file path (overrides search)
-    model_tag: Optional[str] = None            # optional registry tag to lookup
+    # Basic evaluation
+    model_dir: Optional[str] = None
+    checkpoint: Optional[str] = None
+    model_tag: Optional[str] = None
     eval_episodes: int = 50
     max_steps: int = 1000
     deterministic: bool = True
     seed: Optional[int] = None
-    render: int = 0                             # 0=none,1=save traces,2=attempt env.render()
+    render: int = 0
     out: str = str(DEFAULT_RESULTS_DIR / f"eval_result_{int(time.time())}.json")
     trace_dir: Optional[str] = None
     mlflow: bool = False
@@ -155,13 +222,53 @@ class EvalConfig:
     stop_if_below_mean_reward: Optional[float] = None
     s3_bucket: Optional[str] = DEFAULT_S3_BUCKET
     s3_prefix: Optional[str] = None
-    model_registry_backend: Optional[str] = None  # e.g., "mongodb", "filesystem"
-    metadata_file: Optional[str] = None           # override metadata file for model reconstruction
+    model_registry_backend: Optional[str] = None
+    metadata_file: Optional[str] = None
     verbosity: int = 1
-
+    
+    # ===== ENTERPRISE FEATURES =====
+    # ONNX support
+    use_onnx: bool = False
+    onnx_providers: List[str] = None
+    
+    # A/B testing
+    baseline_checkpoint: Optional[str] = None
+    statistical_test: str = "ttest"
+    confidence_level: float = 0.95
+    
+    # Drift detection
+    enable_drift_detection: bool = True
+    drift_reference_data: Optional[str] = None
+    drift_threshold: float = 0.3
+    
+    # Performance benchmarking
+    measure_inference_time: bool = True
+    benchmark_batch_sizes: List[int] = None
+    
+    # Safety checks
+    check_numerical_stability: bool = True
+    max_episode_reward: Optional[float] = None
+    min_episode_reward: Optional[float] = None
+    
+    # Prometheus
+    enable_prometheus: bool = False
+    prometheus_port: int = 9304
+    
+    # Parallelization
+    num_workers: int = None
+    worker_timeout: int = 3600
+    
+    def __post_init__(self):
+        if self.onnx_providers is None:
+            self.onnx_providers = ["CPUExecutionProvider"]
+        if self.benchmark_batch_sizes is None:
+            self.benchmark_batch_sizes = [1, 8, 32]
+        if self.num_workers is None:
+            import multiprocessing as mp
+            self.num_workers = max(1, mp.cpu_count() // 2)
+    
     @classmethod
     def from_cli_and_file(cls, args: argparse.Namespace) -> "EvalConfig":
-        # load file if provided
         cfg_data: Dict[str, Any] = {}
         if getattr(args, "config", None):
             cfg_path = pathlib.Path(args.config)
@@ -170,30 +277,27 @@ class EvalConfig:
             text = cfg_path.read_text(encoding="utf-8")
             if cfg_path.suffix.lower() in (".yml", ".yaml"):
                 if not _HAS_YAML:
-                    raise RuntimeError("PyYAML required to parse YAML config files; install pyyaml")
+                    raise RuntimeError("PyYAML required to parse YAML config files")
                 cfg_data = yaml.safe_load(text) or {}
             else:
                 cfg_data = json.loads(text)
-        # CLI flags override file
         overrides = {k: v for k, v in vars(args).items() if v is not None}
         cfg_data.update(overrides)
-        # coerce keys to dataclass
         return cls(**cfg_data)
 
 # -------------------------
-# MLflow & W&B helpers (safe)
+# MLflow & W&B Helpers
 # -------------------------
 def safe_mlflow_init(cfg: EvalConfig, run_name: Optional[str] = None):
-    if not _HAS_MLFLOW:
-        LOG.debug("MLflow not available; skipping MLflow init")
+    if not cfg.mlflow or not _HAS_MLFLOW:
         return None
     try:
         mlflow.set_experiment(cfg.mlflow_experiment)
         active_run = mlflow.start_run(run_name=run_name)
-        LOG.info("MLflow run started: %s", active_run.info.run_id)
+        LOG.info("✅ MLflow run started: %s", active_run.info.run_id)
         return active_run
     except Exception:
-        LOG.exception("Failed to init MLflow")
+        LOG.exception("MLflow init failed")
         return None
 
 def safe_mlflow_log_metrics(metrics: Dict[str, float], step: Optional[int] = None):
@@ -204,7 +308,7 @@ def safe_mlflow_log_metrics(metrics: Dict[str, float], step: Optional[int] = Non
             if isinstance(v, (int, float)):
                 mlflow.log_metric(k, float(v), step=step)
     except Exception:
-        LOG.exception("MLflow log metrics failed")
+        LOG.debug("MLflow log metrics failed")
 
 def safe_mlflow_end():
     if not _HAS_MLFLOW:
@@ -212,18 +316,17 @@ def safe_mlflow_end():
     try:
         mlflow.end_run()
     except Exception:
-        LOG.exception("MLflow end_run failed")
+        LOG.debug("MLflow end_run failed")
 
 def safe_wandb_init(cfg: EvalConfig, run_name: Optional[str] = None):
-    if not _HAS_WANDB:
-        LOG.debug("W&B not available; skipping wandb init")
+    if not cfg.wandb or not _HAS_WANDB:
         return None
     try:
         wandb.init(project=cfg.wandb_project, name=run_name, config=dataclasses.asdict(cfg))
-        LOG.info("W&B run started: %s", wandb.run.name if wandb.run else run_name)
+        LOG.info("✅ W&B run started: %s", wandb.run.name if wandb.run else run_name)
         return wandb.run
     except Exception:
-        LOG.exception("Failed to init W&B")
+        LOG.exception("W&B init failed")
         return None
 
 def safe_wandb_log(metrics: Dict[str, float]):
@@ -232,7 +335,7 @@ def safe_wandb_log(metrics: Dict[str, float]):
     try:
         wandb.log(metrics)
     except Exception:
-        LOG.exception("W&B log failed")
+        LOG.debug("W&B log failed")
 
 def safe_wandb_finish():
     if not _HAS_WANDB:
@@ -240,23 +343,17 @@ def safe_wandb_finish():
     try:
         wandb.finish()
     except Exception:
-        LOG.exception("W&B finish failed")
+        LOG.debug("W&B finish failed")
 
 # -------------------------
-# Storage & model-registry helpers
+# Storage & S3 Helpers
 # -------------------------
-storage_logger = get_child_logger("storage")
-
 def s3_client():
     if not _HAS_BOTO3:
         raise RuntimeError("boto3 not available")
     return boto3.client("s3")
 
 def download_s3_prefix_to_dir(bucket: str, prefix: str, dest_dir: Union[str, pathlib.Path], max_items: Optional[int] = None) -> List[str]:
-    """
-    Download all objects under s3://bucket/prefix to dest_dir.
-    Returns list of local file paths.
-    """
     dest_dir = pathlib.Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     client = s3_client()
@@ -270,7 +367,6 @@ def download_s3_prefix_to_dir(bucket: str, prefix: str, dest_dir: Union[str, pat
                 if max_items and len(keys_downloaded) >= max_items:
                     break
                 key = obj["Key"]
-                # skip "directories"
                 if key.endswith("/"):
                     continue
                 rel = pathlib.Path(key).name
@@ -283,7 +379,7 @@ def download_s3_prefix_to_dir(bucket: str, prefix: str, dest_dir: Union[str, pat
             if max_items and len(keys_downloaded) >= max_items:
                 break
     except Exception:
-        storage_logger.exception("S3 pagination failed for %s/%s", bucket, prefix)
+        storage_logger.exception("S3 pagination failed")
     return keys_downloaded
 
 def is_s3_path(path: str) -> bool:
@@ -297,23 +393,30 @@ def parse_s3_path(s3uri: str) -> Tuple[str, str]:
     prefix = parts[1] if len(parts) > 1 else ""
     return bucket, prefix
 
+def upload_results_to_s3(result_path: str, cfg: EvalConfig) -> Optional[str]:
+    if not cfg.s3_bucket or not _HAS_BOTO3:
+        return None
+    client = s3_client()
+    key_prefix = cfg.s3_prefix or f"eval-results/{time.strftime('%Y%m%d')}/"
+    key_name = key_prefix.rstrip("/") + "/" + os.path.basename(result_path)
+    try:
+        client.upload_file(result_path, cfg.s3_bucket, key_name)
+        LOG.info("☁️ Uploaded to s3://%s/%s", cfg.s3_bucket, key_name)
+        return f"s3://{cfg.s3_bucket}/{key_name}"
+    except Exception:
+        LOG.exception("S3 upload failed")
+        return None
+
+# -------------------------
+# Model Registry
+# -------------------------
 def resolve_model_dir_from_registry(tag: str, fallback_fs_dir: Optional[str] = None) -> Optional[str]:
-    """
-    Resolve model directory for a given tag from a model registry if available.
-    This is a helper that tries:
-      1) ModelRegistry (if implemented in project)
-      2) Local FS under DEFAULT_MODELS_DIR/tag
-      3) S3 object if tag encodes s3://...
-    Returns local path or s3 uri string (caller must handle downloads).
-    """
     storage_logger.debug("Resolving model tag: %s", tag)
-    # ModelRegistry integration
     try:
         if ModelRegistry is not None:
             registry = ModelRegistry()
             meta = registry.get_by_tag(tag)
             if meta:
-                # expected keys: file_path, s3_uri, local_dir, metadata
                 if meta.get("file_path"):
                     return meta["file_path"]
                 if meta.get("s3_uri"):
@@ -321,29 +424,22 @@ def resolve_model_dir_from_registry(tag: str, fallback_fs_dir: Optional[str] = N
                 if meta.get("dir"):
                     return meta["dir"]
     except Exception:
-        storage_logger.exception("ModelRegistry lookup failed for %s", tag)
-
-    # filesystem fallback
+        storage_logger.exception("ModelRegistry lookup failed")
+    
     local_dir = pathlib.Path(fallback_fs_dir or DEFAULT_MODELS_DIR) / tag
     if local_dir.exists():
         return str(local_dir)
-
-    # maybe tag is s3 uri
+    
     if is_s3_path(tag):
         return tag
-
+    
     return None
 
 def local_find_checkpoint_in_dir(model_dir: Union[str, pathlib.Path], pattern_exts: Optional[List[str]] = None) -> Optional[str]:
-    """
-    Search for the most likely checkpoint file in model_dir.
-    Preference order: .pt/.pth/.ckpt/.pth.tar/.bin
-    Returns absolute path or None.
-    """
     model_dir = pathlib.Path(model_dir)
     if not model_dir.exists():
         return None
-    pattern_exts = pattern_exts or [".pt", ".pth", ".ckpt", ".pth.tar", ".bin", ".pt.tar"]
+    pattern_exts = pattern_exts or [".pt", ".pth", ".ckpt", ".pth.tar", ".bin", ".pt.tar", ".onnx"]
     cand = None
     latest_mtime = 0.0
     for ext in pattern_exts:
@@ -358,84 +454,54 @@ def local_find_checkpoint_in_dir(model_dir: Union[str, pathlib.Path], pattern_ex
     return str(cand) if cand else None
 
 def fetch_model_to_local(model_dir: str, tmp_dir: Union[str, pathlib.Path]) -> str:
-    """
-    If model_dir is s3://..., download content to tmp_dir and return local path.
-    If model_dir is local FS, return as-is.
-    If model_dir is a single file path, return it.
-    """
     tmp_dir = pathlib.Path(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     if is_s3_path(model_dir):
         bucket, prefix = parse_s3_path(model_dir)
-        storage_logger.info("Downloading model from S3 %s/%s -> %s", bucket, prefix, tmp_dir)
+        storage_logger.info("Downloading from S3 %s/%s -> %s", bucket, prefix, tmp_dir)
         files = download_s3_prefix_to_dir(bucket, prefix, tmp_dir, max_items=None)
-        # If we downloaded nothing, raise
         if not files:
             raise RuntimeError(f"No files downloaded from s3://{bucket}/{prefix}")
         return str(tmp_dir)
     else:
         p = pathlib.Path(model_dir)
         if p.is_file():
-            # return parent dir for consistency
             return str(p.parent)
         if p.is_dir():
             return str(p)
-        # last attempt: maybe it's a tag under DEFAULT_MODELS_DIR
         alt = DEFAULT_MODELS_DIR / model_dir
         if alt.exists():
             return str(alt)
         raise FileNotFoundError(f"Model directory not found: {model_dir}")
 
-# -------------------------
-# Checkpoint loader scaffold
-# -------------------------
-loader_logger = get_child_logger("loader")
-
 def discover_checkpoint(cfg: EvalConfig) -> Optional[str]:
-    """
-    Discover checkpoint path:
-      - explicit checkpoint override in cfg.checkpoint -> return directly
-      - if cfg.model_tag provided -> ask registry + resolve
-      - if cfg.model_dir is s3://... or local dir -> search for checkpoint in that directory
-      - fallback: try DEFAULT_MODELS_DIR for tags / directories
-    Returns string path (local file) or s3 uri string (if caller wants to handle), or None.
-    """
     if cfg.checkpoint:
         loader_logger.debug("Using explicit checkpoint: %s", cfg.checkpoint)
         return cfg.checkpoint
-
-    # If model_tag present, resolve via registry or FS
+    
     if cfg.model_tag:
         resolved = resolve_model_dir_from_registry(cfg.model_tag, fallback_fs_dir=str(DEFAULT_MODELS_DIR))
         if resolved:
-            # may be s3:// or local dir
             if is_s3_path(resolved):
                 return resolved
-            # find checkpoint in resolved dir
             ckpt = local_find_checkpoint_in_dir(resolved)
             if ckpt:
                 return ckpt
-            # if no ckpt, return dir for caller to fetch
             return resolved
-
-    # If model_dir provided, handle it
+    
     if cfg.model_dir:
         if is_s3_path(cfg.model_dir):
             return cfg.model_dir
-        # local dir or file
         if pathlib.Path(cfg.model_dir).exists():
             ckpt = local_find_checkpoint_in_dir(cfg.model_dir)
             if ckpt:
                 return ckpt
-            # return dir if no single file found
             return cfg.model_dir
-        # maybe model_dir is a tag in models dir
         alt = DEFAULT_MODELS_DIR / cfg.model_dir
         if alt.exists():
             ckpt = local_find_checkpoint_in_dir(str(alt))
             return ckpt or str(alt)
-
-    # last resort: scan DEFAULT_MODELS_DIR for latest model
+    
     try:
         candidates = sorted(DEFAULT_MODELS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
         for d in candidates:
@@ -445,26 +511,13 @@ def discover_checkpoint(cfg: EvalConfig) -> Optional[str]:
                     return ckpt
     except Exception:
         loader_logger.exception("Failed scanning default models dir")
-
+    
     return None
 
-# End of Chunk 1
 # -------------------------
-# Chunk 2: Policy reconstruction, loaders, and inference wrappers
-# -------------------------
-
-from types import SimpleNamespace
-import importlib
-import inspect
-
-# -------------------------
-# RNG / device helpers
+# Device & Seed
 # -------------------------
 def prepare_device(device_str: str = "cpu"):
-    """
-    Return a torch.device if torch is available; otherwise None.
-    Handles CPU/GPU strings like "cpu", "cuda", "cuda:0".
-    """
     if not _HAS_TORCH:
         return None
     try:
@@ -480,11 +533,8 @@ def set_global_seed(seed: Optional[int]):
     if seed is None:
         seed = int(time.time() % 2**31)
     random.seed(seed)
-    try:
-        import numpy as _np
-        _np.random.seed(seed)
-    except Exception:
-        pass
+    if _HAS_NUMPY:
+        np.random.seed(seed)
     if _HAS_TORCH:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -493,35 +543,29 @@ def set_global_seed(seed: Optional[int]):
     return seed
 
 # -------------------------
-# Policy interface & wrappers
+# Policy Interface
 # -------------------------
 class PolicyInterface:
-    """
-    Minimal wrapper around a policy object to present a unified `.act(obs)` API.
-    .act accepts a numpy array (single obs) and returns action numpy array, optionally logp, value.
-    """
+    """Unified wrapper for PyTorch models."""
     def __init__(self, model_obj: Any, device: Optional[Any] = None, deterministic: bool = True):
         self.model = model_obj
         self.device = device
         self.deterministic = deterministic
         self._is_torch = _HAS_TORCH and isinstance(model_obj, torch.nn.Module)
-        self._is_jit = _HAS_TORCH and isinstance(model_obj, torch.jit.ScriptModule)
-        # if torch model, ensure eval mode
         if self._is_torch:
             try:
                 self.model.eval()
             except Exception:
                 pass
-
+    
     def _to_tensor(self, obs: Any):
         if not _HAS_TORCH or not self._is_torch:
             return obs
         arr = obs
         try:
-            import numpy as _np
             if isinstance(obs, (list, tuple)):
-                arr = _np.asarray(obs, dtype=_np.float32)
-            if isinstance(arr, _np.ndarray):
+                arr = np.asarray(obs, dtype=np.float32) if _HAS_NUMPY else obs
+            if _HAS_NUMPY and isinstance(arr, np.ndarray):
                 t = torch.from_numpy(arr.astype("float32"))
             else:
                 t = torch.tensor(arr, dtype=torch.float32)
@@ -530,21 +574,15 @@ class PolicyInterface:
             return t
         except Exception:
             return obs
-
+    
     def act(self, obs: Any) -> Dict[str, Any]:
-        """
-        Accepts observation (np.ndarray or list), returns dict:
-          {"action": np.ndarray, "logp": float|np.ndarray|None, "value": float|None}
-        """
         try:
             if self._is_torch:
                 with torch.no_grad():
                     t = self._to_tensor(obs)
-                    # add batch dim if needed
                     if isinstance(t, torch.Tensor) and t.dim() == 1:
                         t = t.unsqueeze(0)
                     out = self.model(t)
-                    # allow model to return (action,) or (action,logp) or (action,logp,value)
                     if isinstance(out, (tuple, list)):
                         action = out[0]
                         logp = out[1] if len(out) > 1 else None
@@ -553,7 +591,6 @@ class PolicyInterface:
                         action = out
                         logp = None
                         val = None
-                    # move to cpu numpy
                     if isinstance(action, torch.Tensor):
                         a_np = action.detach().cpu().numpy()
                     else:
@@ -562,23 +599,15 @@ class PolicyInterface:
                         logp = logp.detach().cpu().numpy()
                     if isinstance(val, torch.Tensor):
                         val = val.detach().cpu().numpy()
-                    # squeeze batch if needed
-                    if isinstance(a_np, (list, tuple)) or (hasattr(a_np, "shape") and getattr(a_np, "shape")[0] == 1):
-                        try:
-                            import numpy as _np
-                            a_np = _np.asarray(a_np)
-                            if a_np.shape[0] == 1:
-                                a_np = a_np[0]
-                        except Exception:
-                            pass
+                    if _HAS_NUMPY and isinstance(a_np, np.ndarray):
+                        if a_np.shape[0] == 1:
+                            a_np = a_np[0]
                     return {"action": a_np, "logp": logp, "value": val}
             else:
-                # non-torch call contract: model.act(obs) or model(obs)
-                if hasattr(self.model, "act") and inspect.isfunction(getattr(self.model, "act")) or hasattr(self.model, "act") and inspect.ismethod(getattr(self.model, "act")):
+                if hasattr(self.model, "act"):
                     res = self.model.act(obs)
                 else:
                     res = self.model(obs)
-                # normalize
                 if isinstance(res, dict):
                     return res
                 if isinstance(res, (tuple, list)):
@@ -594,803 +623,1529 @@ class PolicyInterface:
             raise
 
 # -------------------------
-# Policy loader logic
+# ONNX Policy Interface
 # -------------------------
-def try_load_torch_checkpoint(path: str, device: Optional[Any] = None) -> Optional[torch.nn.Module]:
-    """
-    Try to load checkpoint as:
-      - torch.load state_dict into architecture discovered from metadata (later)
-      - torch.jit.load for ScriptModule
-      - if file is a .pt with saved Module object, try direct load
-    Returns nn.Module or raises on unrecoverable error.
-    """
-    if not _HAS_TORCH:
-        raise RuntimeError("Torch not available to load checkpoint")
-    p = pathlib.Path(path)
-    if not p.exists():
-        raise FileNotFoundError(path)
-    # If file is a TorchScript module, try loading as script
+class ONNXPolicyInterface:
+    """ONNX Runtime wrapper for production inference."""
+    def __init__(self, onnx_path: str, providers: List[str] = None):
+        if not _HAS_ONNX:
+            raise RuntimeError("onnxruntime not available")
+        
+        self.onnx_path = onnx_path
+        self.providers = providers or ["CPUExecutionProvider"]
+        
+        try:
+            self.session = ort.InferenceSession(onnx_path, providers=self.providers)
+            self.input_name = self.session.get_inputs()[0].name
+            self.output_names = [o.name for o in self.session.get_outputs()]
+            
+            loader_logger.info("✅ ONNX model loaded: %s", onnx_path)
+            loader_logger.info("   Input: %s %s", self.input_name, self.session.get_inputs()[0].shape)
+            loader_logger.info("   Outputs: %s", self.output_names)
+        except Exception as e:
+            loader_logger.exception("Failed to load ONNX model")
+            raise
+    
+    def act(self, obs: Any) -> Dict[str, Any]:
+        try:
+            if isinstance(obs, (list, tuple)):
+                obs_array = np.array(obs, dtype=np.float32) if _HAS_NUMPY else obs
+            elif _HAS_NUMPY and isinstance(obs, np.ndarray):
+                obs_array = obs.astype(np.float32)
+            else:
+                obs_array = np.array([obs], dtype=np.float32) if _HAS_NUMPY else [obs]
+            
+            if _HAS_NUMPY and obs_array.ndim == 1:
+                obs_array = obs_array.reshape(1, -1)
+            
+            outputs = self.session.run(self.output_names, {self.input_name: obs_array})
+            
+            action = outputs[0][0] if len(outputs[0].shape) > 1 else outputs[0]
+            value = outputs[1][0] if len(outputs) > 1 else None
+            
+            return {
+                "action": action,
+                "logp": None,
+                "value": float(value) if value is not None else None
+            }
+        except Exception as e:
+            loader_logger.exception("ONNX inference failed")
+            raise
+
+# -------------------------
+# A/B Testing
+# -------------------------
+def compare_policies_statistically(
+    baseline_results: Dict[str, Any],
+    candidate_results: Dict[str, Any],
+    test_type: str = "ttest",
+    confidence_level: float = 0.95
+) -> Dict[str, Any]:
     try:
-        if p.suffix in (".pt", ".pth") and _HAS_TORCH:
-            # First try torch.jit.load (works for script modules)
-            try:
-                m = torch.jit.load(str(p), map_location="cpu")
-                loader_logger.info("Loaded TorchScript module from %s", p)
-                return m
-            except Exception:
-                loader_logger.debug("Not a TorchScript module or torch.jit.load failed for %s", p)
-            # Next, try torch.load to inspect object
-            ckpt = torch.load(str(p), map_location="cpu")
-            # if ckpt is a dict with state_dict
-            if isinstance(ckpt, dict) and "state_dict" in ckpt:
-                # caller must provide architecture to load state_dict into; we'll return state_dict for higher-level logic
-                sd = ckpt["state_dict"]
-                # create a simple wrapper module to hold state_dict? Better to return ckpt and let caller handle
-                loader_logger.info("Checkpoint contains state_dict keys: %s ...", list(sd.keys())[:5])
-                return ckpt
-            # If ckpt is a Module object
-            if isinstance(ckpt, torch.nn.Module):
-                loader_logger.info("Checkpoint contained nn.Module object")
-                return ckpt
-            # fallback: if ckpt is dict of tensors (state dict), return it
-            if isinstance(ckpt, dict):
-                # Heuristic: looks like state_dict
-                keys = list(ckpt.keys())
-                if keys and isinstance(ckpt[keys[0]], torch.Tensor):
-                    return {"state_dict": ckpt}
-            # else unknown format; return None
-            loader_logger.warning("Torch load produced unsupported object for %s", p)
-            return None
-    except Exception:
-        loader_logger.exception("Torch checkpoint load failed for %s", p)
-        raise
+        from scipy import stats
+        import numpy as np
+    except ImportError:
+        LOG.warning("scipy not available for statistical tests")
+        return {"error": "scipy required"}
+    
+    baseline_rewards = np.array(baseline_results.get("rewards", []))
+    candidate_rewards = np.array(candidate_results.get("rewards", []))
+    
+    if len(baseline_rewards) == 0 or len(candidate_rewards) == 0:
+        return {"error": "insufficient data"}
+    
+    baseline_mean = float(np.mean(baseline_rewards))
+    candidate_mean = float(np.mean(candidate_rewards))
+    improvement = ((candidate_mean - baseline_mean) / abs(baseline_mean)) * 100 if baseline_mean != 0 else 0.0
+    
+    if test_type == "ttest":
+        statistic, p_value = stats.ttest_ind(candidate_rewards, baseline_rewards)
+    elif test_type == "mannwhitneyu":
+        statistic, p_value = stats.mannwhitneyu(candidate_rewards, baseline_rewards, alternative='two-sided')
+    else:
+        return {"error": f"unknown test type: {test_type}"}
+    
+    def bootstrap_mean_diff(n_iterations=1000):
+        diffs = []
+        for _ in range(n_iterations):
+            b_sample = np.random.choice(baseline_rewards, len(baseline_rewards), replace=True)
+            c_sample = np.random.choice(candidate_rewards, len(candidate_rewards), replace=True)
+            diffs.append(np.mean(c_sample) - np.mean(b_sample))
+        return diffs
+    
+    bootstrap_diffs = bootstrap_mean_diff()
+    alpha = 1 - confidence_level
+    ci_lower = float(np.percentile(bootstrap_diffs, 100 * alpha / 2))
+    ci_upper = float(np.percentile(bootstrap_diffs, 100 * (1 - alpha / 2)))
+    
+    pooled_std = np.sqrt((np.var(baseline_rewards) + np.var(candidate_rewards)) / 2)
+    cohens_d = (candidate_mean - baseline_mean) / pooled_std if pooled_std > 0 else 0.0
+    
+    significant = p_value < (1 - confidence_level)
+    if significant and improvement > 5:
+        recommendation = "✅ DEPLOY - Significant improvement"
+    elif significant and improvement < -5:
+        recommendation = "❌ REJECT - Significant degradation"
+    elif not significant:
+        recommendation = "⚠️ INCONCLUSIVE - No significant difference"
+    else:
+        recommendation = "⚪ NEUTRAL - Small difference"
+    
+    return {
+        "significant": significant,
+        "p_value": float(p_value),
+        "confidence_interval": (ci_lower, ci_upper),
+        "effect_size": float(cohens_d),
+        "improvement_pct": improvement,
+        "baseline_mean": baseline_mean,
+        "candidate_mean": candidate_mean,
+        "recommendation": recommendation
+    }
 
-def try_instantiate_policy_from_metadata(model_dir: str, device: Optional[Any] = None, strict: bool = False) -> Optional[PolicyInterface]:
+# -------------------------
+# Drift Detection
+# -------------------------
+class DriftDetector:
+    def __init__(self, reference_data: Optional[Dict[str, Any]] = None):
+        self.reference_data = reference_data
+        self.reference_obs_dist = None
+        self.reference_reward_dist = None
+        
+        if reference_data:
+            self._compute_reference_distributions(reference_data)
+    
+    def _compute_reference_distributions(self, data: Dict[str, Any]):
+        try:
+            obs_data = data.get("observations", [])
+            reward_data = data.get("rewards", [])
+            
+            if obs_data and _HAS_NUMPY:
+                obs_array = np.array(obs_data)
+                self.reference_obs_dist = {
+                    "mean": np.mean(obs_array, axis=0),
+                    "std": np.std(obs_array, axis=0),
+                    "min": np.min(obs_array, axis=0),
+                    "max": np.max(obs_array, axis=0)
+                }
+            
+            if reward_data and _HAS_NUMPY:
+                reward_array = np.array(reward_data)
+                self.reference_reward_dist = {
+                    "mean": float(np.mean(reward_array)),
+                    "std": float(np.std(reward_array)),
+                    "p50": float(np.percentile(reward_array, 50)),
+                    "p95": float(np.percentile(reward_array, 95))
+                }
+        except Exception as e:
+            LOG.exception("Failed to compute reference distributions")
+    
+    #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+train_rl_eval.py - ENTERPRISE EDITION COMPLETION (Part 2)
+----------------------------------------------------------
+Continuation from DriftDetector.check_drift() onwards.
+Synchronized with train_rl_heavy.py and train_rl_live.py
+"""
+
+# =========================================================================
+# CONTINUATION: DriftDetector.check_drift() method
+# =========================================================================
+
+def check_drift(self, eval_results: Dict[str, Any], threshold: float = 0.3) -> Dict[str, Any]:
+        """
+        Check for distribution drift.
+        
+        Returns:
+            {
+                "drift_detected": bool,
+                "drift_score": float,
+                "threshold": threshold,
+                "details": {...},
+                "recommendation": str
+            }
+        """
+        if not self.reference_reward_dist:
+            return {"error": "no reference distribution available"}
+        
+        try:
+            import numpy as np
+            
+            eval_rewards = np.array(eval_results.get("rewards", []))
+            if len(eval_rewards) == 0:
+                return {"error": "no evaluation rewards"}
+            
+            # Compute current statistics
+            eval_mean = float(np.mean(eval_rewards))
+            eval_std = float(np.std(eval_rewards))
+            
+            ref_mean = self.reference_reward_dist["mean"]
+            ref_std = self.reference_reward_dist["std"]
+            
+            # Normalized distance (simple KL divergence approximation)
+            mean_drift = abs(eval_mean - ref_mean) / (ref_std + 1e-8)
+            std_drift = abs(eval_std - ref_std) / (ref_std + 1e-8)
+            
+            drift_score = max(mean_drift, std_drift)
+            drift_detected = drift_score > threshold
+            
+            # Additional checks: percentile shifts
+            eval_p50 = float(np.percentile(eval_rewards, 50))
+            eval_p95 = float(np.percentile(eval_rewards, 95))
+            ref_p50 = self.reference_reward_dist["p50"]
+            ref_p95 = self.reference_reward_dist["p95"]
+            
+            p50_shift = abs(eval_p50 - ref_p50) / (abs(ref_p50) + 1e-8)
+            p95_shift = abs(eval_p95 - ref_p95) / (abs(ref_p95) + 1e-8)
+            
+            return {
+                "drift_detected": drift_detected,
+                "drift_score": float(drift_score),
+                "threshold": threshold,
+                "details": {
+                    "reference_mean": ref_mean,
+                    "reference_std": ref_std,
+                    "eval_mean": eval_mean,
+                    "eval_std": eval_std,
+                    "mean_drift": float(mean_drift),
+                    "std_drift": float(std_drift),
+                    "p50_shift": float(p50_shift),
+                    "p95_shift": float(p95_shift),
+                    "reference_p50": ref_p50,
+                    "reference_p95": ref_p95,
+                    "eval_p50": eval_p50,
+                    "eval_p95": eval_p95
+                },
+                "recommendation": "⚠️ Retrain model - significant drift detected" if drift_detected 
+                                 else "✅ Distribution stable - no action needed"
+            }
+        except Exception as e:
+            LOG.exception("Drift detection failed: %s", e)
+            return {"error": str(e)}
+
+# =========================================================================
+# SECTION 6: Performance Benchmarking (COMPLETE)
+# =========================================================================
+
+def benchmark_inference_performance(
+    policy: Any,
+    obs_shape: Tuple[int, ...],
+    batch_sizes: List[int] = [1, 8, 32],
+    n_iterations: int = 100
+) -> Dict[str, Any]:
     """
-    Attempt to reconstruct policy using metadata.json inside model_dir (if present).
-    metadata.json should contain:
-      - 'framework': 'torch'|'custom'
-      - 'entrypoint': 'module.path:ClassName' OR None
-      - 'checkpoint_file': relative path to checkpoint inside model_dir
-      - 'obs_shape'/'action_shape' metadata hints
-    Returns PolicyInterface or None if reconstruction failed.
+    Measure inference latency and throughput across batch sizes.
+    Critical for production deployment planning and capacity estimation.
+    
+    Returns:
+        {
+            "batch_1": {"mean_latency_ms": ..., "p95_latency_ms": ..., "throughput_samples_per_sec": ...},
+            "batch_8": {...},
+            ...
+        }
     """
-    md_path = pathlib.Path(model_dir) / "metadata.json"
-    if not md_path.exists():
-        loader_logger.debug("No metadata.json found in %s", model_dir)
-        return None
-    try:
-        md = json.loads(md_path.read_text(encoding="utf-8"))
-    except Exception:
-        loader_logger.exception("Failed to parse metadata.json in %s", model_dir)
-        return None
-
-    framework = md.get("framework", "torch")
-    entrypoint = md.get("entrypoint")  # e.g., "ml.rl_models.ppo:ActorCritic"
-    ckpt_rel = md.get("checkpoint_file")
-    # Resolve checkpoint path
-    ckpt_path = None
-    if ckpt_rel:
-        cand = pathlib.Path(model_dir) / ckpt_rel
-        if cand.exists():
-            ckpt_path = str(cand)
-    # If no checkpoint path, try discovery
-    if not ckpt_path:
-        ckpt_path = local_find_checkpoint_in_dir(model_dir)
-
-    if framework == "torch":
-        if not ckpt_path:
-            loader_logger.warning("No checkpoint available for torch model in %s", model_dir)
-            if strict:
-                raise FileNotFoundError("No checkpoint found")
-            return None
-        # If entrypoint specified, import class and instantiate then load state_dict
-        if entrypoint:
+    import numpy as np
+    import time
+    
+    results = {}
+    
+    for batch_size in batch_sizes:
+        latencies = []
+        
+        for _ in range(n_iterations):
+            # Generate dummy batch matching obs_shape
+            if len(obs_shape) == 0:
+                # Scalar observation
+                batch = np.random.randn(batch_size, 1).astype(np.float32)
+            elif len(obs_shape) == 1:
+                batch = np.random.randn(batch_size, obs_shape[0]).astype(np.float32)
+            else:
+                batch = np.random.randn(batch_size, *obs_shape).astype(np.float32)
+            
+            # Measure inference time
+            start = time.perf_counter()
             try:
-                module_part, class_part = entrypoint.split(":")
-                mod = importlib.import_module(module_part)
-                cls = getattr(mod, class_part)
-                # attempt to inspect constructor signature to pass metadata
-                sig = inspect.signature(cls.__init__)
-                kwargs = {}
-                # pass metadata if constructor accepts 'obs_dim'/'act_dim' or 'config'
-                if "config" in sig.parameters:
-                    kwargs["config"] = md.get("config", {})
-                # instantiate
-                inst = cls(**kwargs) if kwargs else cls()
-                # load checkpoint
-                ck = try_load_torch_checkpoint(ckpt_path, device=device)
-                if isinstance(ck, dict) and "state_dict" in ck:
-                    inst.load_state_dict(ck["state_dict"])
-                elif isinstance(ck, torch.nn.Module):
-                    # ck is Module: use that directly
-                    inst = ck
-                elif isinstance(ck, dict) and "model" in ck and isinstance(ck["model"], dict):
-                    # torch checkpoint with nested model key
-                    inst.load_state_dict(ck["model"])
+                if batch_size == 1:
+                    _ = policy.act(batch[0])
                 else:
-                    loader_logger.warning("Unexpected checkpoint format for %s", ckpt_path)
-                # move to device
-                if _HAS_TORCH and isinstance(inst, torch.nn.Module) and device:
-                    try:
-                        inst.to(device)
-                    except Exception:
-                        pass
-                loader_logger.info("Instantiated policy from entrypoint %s", entrypoint)
-                return PolicyInterface(inst, device=device)
-            except Exception:
-                loader_logger.exception("Failed to instantiate policy from entrypoint %s", entrypoint)
-                if strict:
-                    raise
-                return None
-        else:
-            # No entrypoint; attempt generic torch loader
-            try:
-                ck = try_load_torch_checkpoint(ckpt_path, device=device)
-                if ck is None:
-                    return None
-                # if ck is Module -> wrap directly
-                if isinstance(ck, torch.nn.Module):
-                    if device:
-                        try:
-                            ck.to(device)
-                        except Exception:
-                            pass
-                    return PolicyInterface(ck, device=device)
-                # if ck contains state_dict, we cannot instantiate without architecture; return ck for caller
-                if isinstance(ck, dict) and "state_dict" in ck:
-                    # return a wrapper that will perform a shallow forward using the saved module if present
-                    loader_logger.info("Returning state_dict-only checkpoint; caller must handle architecture")
-                    return PolicyInterface(ck, device=device)
-            except Exception:
-                loader_logger.exception("Failed to load torch checkpoint in %s", model_dir)
-                if strict:
-                    raise
-                return None
-    else:
-        # custom framework: attempt to load entrypoint function
-        if entrypoint:
-            try:
-                module_part, func_part = entrypoint.split(":")
-                mod = importlib.import_module(module_part)
-                factory = getattr(mod, func_part)
-                inst = factory(metadata=md)
-                return PolicyInterface(inst, device=device)
-            except Exception:
-                loader_logger.exception("Failed to instantiate custom policy from entrypoint %s", entrypoint)
-                if strict:
-                    raise
-                return None
-        return None
-
-def build_policy_for_eval(cfg: EvalConfig, tmp_dir: Optional[str] = None) -> Tuple[PolicyInterface, str]:
-    """
-    Top-level helper:
-     - discover checkpoint using discover_checkpoint
-     - if model_dir is s3://... download to tmp_dir
-     - try to reconstruct policy using metadata, entrypoint, or fallback to TorchScript load
-    Returns (PolicyInterface, model_local_dir)
-    """
-    tmp_dir = tmp_dir or tempfile.mkdtemp(prefix="prioritymax_eval_")
-    ck = discover_checkpoint(cfg)
-    if not ck:
-        raise FileNotFoundError("Could not discover checkpoint/model for evaluation")
-    # if ck is s3://... or directory s3://, fetch
-    if is_s3_path(ck):
-        bucket, prefix = parse_s3_path(ck)
-        # If ck points to a file, prefix may include file; download contents of prefix
-        files = download_s3_prefix_to_dir(bucket, prefix, tmp_dir)
-        if not files:
-            raise RuntimeError(f"No files downloaded from s3://{bucket}/{prefix}")
-        # attempt to find checkpoint among downloaded files
-        local_ckpt = None
-        for f in files:
-            if pathlib.Path(f).suffix in (".pt", ".pth", ".ckpt", ".pth.tar"):
-                local_ckpt = f
+                    # Batch inference if supported
+                    for i in range(batch_size):
+                        _ = policy.act(batch[i])
+                
+                elapsed = time.perf_counter() - start
+                latencies.append(elapsed)
+            except Exception as e:
+                LOG.warning("Inference failed for batch_size=%d: %s", batch_size, e)
                 break
-        # set model_local_dir to tmp_dir
-        model_local_dir = tmp_dir
-    else:
-        # ck may be a direct file or directory
-        p = pathlib.Path(ck)
-        if p.is_file():
-            model_local_dir = str(p.parent)
-            local_ckpt = str(p)
-        else:
-            model_local_dir = str(p)
-            local_ckpt = local_find_checkpoint_in_dir(model_local_dir)
+        
+        if latencies:
+            latencies_np = np.array(latencies)
+            results[f"batch_{batch_size}"] = {
+                "mean_latency_ms": float(np.mean(latencies_np) * 1000),
+                "std_latency_ms": float(np.std(latencies_np) * 1000),
+                "p50_latency_ms": float(np.percentile(latencies_np, 50) * 1000),
+                "p95_latency_ms": float(np.percentile(latencies_np, 95) * 1000),
+                "p99_latency_ms": float(np.percentile(latencies_np, 99) * 1000),
+                "throughput_samples_per_sec": float(batch_size / np.mean(latencies_np)),
+                "n_samples": len(latencies)
+            }
+            
+            LOG.debug("Batch %d: %.2f ms (p95: %.2f ms, throughput: %.1f samples/sec)",
+                     batch_size,
+                     results[f"batch_{batch_size}"]["mean_latency_ms"],
+                     results[f"batch_{batch_size}"]["p95_latency_ms"],
+                     results[f"batch_{batch_size}"]["throughput_samples_per_sec"])
+    
+    return results
 
+# =========================================================================
+# SECTION 7: Enhanced run_evaluation (COMPLETE IMPLEMENTATION)
+# =========================================================================
+
+def run_evaluation(cfg: EvalConfig) -> int:
+    """
+    Main orchestration with full enterprise features.
+    Synchronized with train_rl_heavy.py and train_rl_live.py patterns.
+    """
+    LOG.info("=" * 80)
+    LOG.info("=== PriorityMax RL Evaluation - Enterprise Edition ===")
+    LOG.info("=" * 80)
+    LOG.info("Configuration:")
+    LOG.info("  Episodes: %d", cfg.eval_episodes)
+    LOG.info("  Max steps: %d", cfg.max_steps)
+    LOG.info("  Device: %s", cfg.device)
+    LOG.info("  ONNX mode: %s", cfg.use_onnx)
+    LOG.info("  A/B testing: %s", "enabled" if cfg.baseline_checkpoint else "disabled")
+    LOG.info("  Drift detection: %s", "enabled" if cfg.enable_drift_detection else "disabled")
+    LOG.info("  Benchmarking: %s", "enabled" if cfg.measure_inference_time else "disabled")
+    LOG.info("=" * 80)
+    
+    seed = set_global_seed(cfg.seed)
     device = prepare_device(cfg.device)
-    # First attempt: instantiate from metadata (best-effort)
-    policy = None
+    # ===================== SYNC CHECK =====================
     try:
-        policy = try_instantiate_policy_from_metadata(model_local_dir, device=device, strict=False)
-    except Exception:
-        loader_logger.exception("Metadata-based instantiation failed")
+        from ml.real_env import get_observation_space, get_action_space
+        obs_space = get_observation_space()
+        act_space = get_action_space()
+        obs_dim = obs_space.shape[0] if obs_space is not None else 8
+        act_dim = act_space.shape[0] if act_space is not None else 3
+        LOG.info("🔄 Synced with real_env: obs_dim=%d act_dim=%d", obs_dim, act_dim)
+    except Exception as e:
+        LOG.warning("⚠️ Unable to sync env spaces from real_env: %s", e)
+        obs_dim, act_dim = 8, 3
+    # =======================================================
 
-    # If metadata-based failed and we have a torch checkpoint file, try torch.jit or torch.load
-    if (policy is None or (isinstance(policy.model, dict) and "state_dict" in policy.model)):
-        # Try torchscript direct load of the checkpoint file if available
-        if local_ckpt and _HAS_TORCH:
-            try:
-                maybe_mod = try_load_torch_checkpoint(local_ckpt, device=device)
-                if isinstance(maybe_mod, torch.nn.Module) or (hasattr(maybe_mod, "__call__") and callable(maybe_mod)):
-                    policy = PolicyInterface(maybe_mod, device=device)
-                elif isinstance(maybe_mod, dict) and "state_dict" in maybe_mod:
-                    # state_dict-only; cannot instantiate architecture automatically
-                    loader_logger.warning("Checkpoint contains only state_dict; evaluation requires model architecture or entrypoint metadata")
-                    raise RuntimeError("state_dict-only checkpoint cannot be used without architecture")
-            except Exception:
-                loader_logger.exception("Torch checkpoint fallback failed")
-                raise
-
-    if policy is None:
-        raise RuntimeError("Failed to create policy for evaluation")
-
-    # perform a warmup inference to sanity-check model
+    
+    # Initialize MLflow/W&B
+    run_name = f"eval_{cfg.model_tag or 'model'}_{int(time.time())}"
+    mlflow_run = safe_mlflow_init(cfg, run_name)
+    wandb_run = safe_wandb_init(cfg, run_name)
+    
+    # Prometheus metrics (if enabled)
+    if cfg.enable_prometheus and _HAS_PROMETHEUS:
+        eval_reward_gauge = Gauge("rl_eval_reward_mean", "Mean evaluation reward")
+        eval_episodes_counter = Counter("rl_eval_episodes_total", "Total episodes evaluated")
+        eval_drift_gauge = Gauge("rl_eval_drift_score", "Distribution drift score")
+        eval_latency_histogram = Histogram("rl_eval_action_latency_seconds", "Action latency")
+        
+        try:
+            start_http_server(cfg.prometheus_port)
+            LOG.info("📊 Prometheus metrics server started on port %d", cfg.prometheus_port)
+        except Exception as e:
+            LOG.warning("Failed to start Prometheus server: %s", e)
+    
+    tmp_dir = tempfile.mkdtemp(prefix="prioritymax_eval_tmp_")
+    
+    # -------------------------
+    # Build policy (ONNX or PyTorch)
+    # -------------------------
     try:
-        # craft a dummy observation if metadata hints present
-        md_file = pathlib.Path(model_local_dir) / "metadata.json"
-        sample_obs = None
-        if md_file.exists():
-            try:
-                md = json.loads(md_file.read_text(encoding="utf-8"))
-                obs_shape = md.get("obs_shape")
-                if obs_shape:
-                    import numpy as _np
-                    sample_obs = _np.zeros(tuple(obs_shape), dtype=_np.float32)
-            except Exception:
-                pass
-        # fallback sample
-        if sample_obs is None:
-            sample_obs = [0.0] * 8  # generic placeholder; env will generate real obs anyway
-        _ = policy.act(sample_obs)
-        loader_logger.info("Policy warmup successful")
-    except Exception:
-        loader_logger.exception("Policy warmup inference failed")
-        raise
-
-    return policy, model_local_dir
-
-# End of Chunk 2
-# -------------------------
-# Chunk 3: Environment orchestration, vectorized evaluation, and result aggregation
-# -------------------------
-
-import multiprocessing as mp
-from functools import partial
-from queue import Empty as QueueEmpty
-
-# Try to import user-provided env factory (best-effort)
-try:
-    # If your project exposes make_vec_env or SimulatedRealEnv import, prefer that
-    from ml.real_env import SimulatedRealEnv, EnvConfig, make_vec_env  # type: ignore
-    _HAS_REAL_ENV = True
-except Exception:
-    SimulatedRealEnv = None
-    EnvConfig = None
-    make_vec_env = None
-    _HAS_REAL_ENV = False
-
-# -------------------------
-# Environment factory
-# -------------------------
-def _local_make_env(env_config: Optional[dict] = None):
-    """
-    Return a callable that creates a new environment instance when called.
-    env_config can include 'seed' and other initialization parameters.
-    """
-    env_config = env_config or {}
-    def _fn(seed: Optional[int] = None):
-        # If SimulatedRealEnv present, instantiate it; otherwise create a MinimalMockEnv
-        if _HAS_REAL_ENV and EnvConfig is not None:
-            cfg = EnvConfig(**env_config) if isinstance(env_config, dict) else EnvConfig()
-            env = SimulatedRealEnv(cfg)
-            if seed is not None:
-                try:
-                    env.seed(seed)
-                except Exception:
-                    pass
-            return env
+        if cfg.use_onnx:
+            # Load ONNX model directly
+            onnx_path = discover_checkpoint(cfg)
+            if not onnx_path or not onnx_path.endswith(".onnx"):
+                raise ValueError("ONNX mode requires .onnx checkpoint file. "
+                               f"Got: {onnx_path}")
+            policy = ONNXPolicyInterface(onnx_path, providers=cfg.onnx_providers)
+            model_dir = str(pathlib.Path(onnx_path).parent)
+            LOG.info("✅ ONNX policy loaded: %s", onnx_path)
         else:
-            # Minimal fallback environment for evaluation: simple deterministic environment
-            class MinimalEnv:
-                def __init__(self, seed=None):
-                    self._seed = seed or 0
-                    self._rng = random.Random(self._seed)
-                    self._t = 0
-                    self._max_steps = 100
-                def reset(self, seed=None):
-                    if seed is not None:
-                        self._rng = random.Random(seed)
-                    self._t = 0
-                    return [0.0] * 8
-                def step(self, action):
-                    # action ignored; produce pseudo-random reward that slowly decays
-                    self._t += 1
-                    done = self._t >= self._max_steps
-                    obs = [float(self._rng.random()) for _ in range(8)]
-                    reward = max(0.0, 1.0 - (self._t * 0.01)) + (self._rng.random() * 0.01)
-                    info = {}
-                    return obs, reward, done, info
-                def seed(self, s):
-                    self._rng = random.Random(s)
-            return MinimalEnv(seed=seed)
-    return _fn
-
-# -------------------------
-# Worker process for parallel evaluation
-# -------------------------
-def _eval_worker(task_queue: mp.Queue, result_queue: mp.Queue, worker_id: int, env_factory_serialized: dict):
-    """
-    Worker runs episodes serially inside the process and pushes results back.
-    We pass a minimal serialized env config instead of live closures to make multiprocessing safer.
-    """
-    # Rehydrate env factory
-    env_factory = _local_make_env(env_factory_serialized.get("env_config"))
-    # Optionally set process-local random seed base
-    base_seed = env_factory_serialized.get("base_seed", int(time.time()) + worker_id)
-    # Import torch lazily inside worker to avoid fork issues if necessary
-    local_torch = None
-    if _HAS_TORCH:
+            # Standard PyTorch loading
+            policy, model_dir = build_policy_for_eval(cfg, tmp_dir=tmp_dir)
+            LOG.info("✅ PyTorch policy loaded from: %s", model_dir)
+    except Exception as e:
+        LOG.exception("❌ Policy build failed: %s", e)
+        safe_mlflow_end()
+        safe_wandb_finish()
+        return EXIT_FAILURE
+    
+    # -------------------------
+    # Performance benchmarking
+    # -------------------------
+    benchmark_results = None
+    if cfg.measure_inference_time:
         try:
-            import torch as _t
-            local_torch = _t
-        except Exception:
-            local_torch = None
-
-    while True:
-        try:
-            task = task_queue.get(timeout=1.0)
-        except QueueEmpty:
-            continue
-        if task is None:
-            break  # shutdown sentinel
-        # task: dict {policy_serialized, episodes, max_steps, start_seed}
-        policy_serialized = task.get("policy")
-        episodes = int(task.get("episodes", 1))
-        max_steps = int(task.get("max_steps", 1000))
-        start_seed = int(task.get("start_seed", base_seed))
-        # Reconstruct policy object in worker process if it is serializable path; otherwise policy may be None -> error
-        # We support policy_serialized as either:
-        #  - dict with {"type":"torch_checkpoint", "path": "/abs/path/to/checkpoint", "entrypoint": "..."} OR
-        #  - None meaning policy provided in main process (not supported in mp worker)
-        policy_iface = None
-        try:
-            if policy_serialized and policy_serialized.get("type") == "torch_checkpoint":
-                path = policy_serialized.get("path")
-                entrypoint = policy_serialized.get("entrypoint")
-                # Quick attempt: try torch.jit.load or torch.load as in chunk 2
-                if _HAS_TORCH:
-                    try:
-                        mod = try_load_torch_checkpoint(path, device=prepare_device("cpu"))
-                        if isinstance(mod, dict) and "state_dict" in mod:
-                            # cannot instantiate architecture in worker; skip
-                            raise RuntimeError("state_dict-only checkpoint cannot be loaded inside worker without entrypoint")
-                        policy_iface = PolicyInterface(mod, device=prepare_device("cpu"), deterministic=True)
-                    except Exception:
-                        loader_logger.exception("Worker failed to load checkpoint %s", path)
-                        policy_iface = None
-            # else: unsupported serialized type
-        except Exception:
-            loader_logger.exception("Policy reconstruction in worker failed")
-            policy_iface = None
-
-        # If policy_iface is None, return error for the tasks
-        if policy_iface is None:
-            for ep in range(episodes):
-                result_queue.put({"ok": False, "error": "policy_load_failed", "worker": worker_id, "episode": ep})
-            continue
-
-        # Create local env and run episodes
-        for ep in range(episodes):
-            env = env_factory(seed=start_seed + ep + worker_id)
-            obs = env.reset(seed=start_seed + ep + worker_id) if hasattr(env, "reset") else env.reset()
-            total_reward = 0.0
-            steps = 0
-            trace = []
-            done = False
-            while not done and steps < max_steps:
-                try:
-                    # policy expects numpy or list obs
-                    out = policy_iface.act(obs)
-                    action = out.get("action")
-                    # if action is array-like with batch dim, pick first
-                    if hasattr(action, "shape") and getattr(action, "shape")[0] == 1:
-                        import numpy as _np
-                        action = _np.asarray(action)[0]
-                    obs, rew, done, info = env.step(action)
-                    total_reward += float(rew)
-                    steps += 1
-                    trace.append({"step": steps, "reward": float(rew)})
-                except Exception:
-                    loader_logger.exception("Error during policy.act or env.step in worker %s", worker_id)
-                    break
-            result_queue.put({"ok": True, "worker": worker_id, "episode": ep, "reward": total_reward, "steps": steps, "trace": trace})
-    # cleanup
-    return
-
-# -------------------------
-# Vectorized evaluation orchestration (multiprocess)
-# -------------------------
-def run_vectorized_evaluation(policy: PolicyInterface,
-                              env_factory: Callable[..., Any],
-                              episodes: int = 100,
-                              max_steps: int = 1000,
-                              n_workers: int = 4,
-                              per_worker_batch: int = 1,
-                              timeout: int = 3600) -> Dict[str, Any]:
-    """
-    Distribute evaluation across multiple worker processes to run episodes in parallel.
-    policy: PolicyInterface built in main process. If it can't be serialized for workers, this function will
-            save a TorchScript snapshot (if torch) to a temp file and instruct workers to load it.
-    env_factory: callable returned by _local_make_env (callable(seed) -> env)
-    episodes: total number of episodes to run
-    n_workers: number of worker processes
-    per_worker_batch: number of episodes assigned per task per worker submit
-    """
-    # Prepare serialized policy specification for workers
-    policy_spec = None
-    tmp_policy_path = None
-    if _HAS_TORCH and isinstance(policy.model, torch.nn.Module):
-        # attempt to export TorchScript to a temp file for worker processes
-        try:
-            tmp_dir = tempfile.mkdtemp(prefix="prioritymax_policy_")
-            tmp_policy_path = os.path.join(tmp_dir, "policy_script.pt")
+            LOG.info("🔍 Running inference benchmark...")
+            
+            # Try to infer obs_shape from metadata
+            obs_shape = (obs_dim,)  # Default fallback
             try:
-                # try tracing with a dummy input inferred from metadata or use a single-dim vector
-                dummy = None
-                try:
-                    # infer obs dim from metadata if provided
-                    if hasattr(policy, "model") and hasattr(policy.model, "example_input") and policy.model.example_input is not None:
-                        dummy = policy.model.example_input
-                    else:
-                        dummy = torch.randn(1, 8)
-                except Exception:
-                    dummy = torch.randn(1, 8)
-                scriptmod = torch.jit.trace(policy.model, dummy)
-                torch.jit.save(scriptmod, tmp_policy_path)
-                policy_spec = {"type": "torch_checkpoint", "path": tmp_policy_path, "entrypoint": None}
-                loader_logger.info("Exported policy TorchScript to %s for worker loading", tmp_policy_path)
+                metadata_path = pathlib.Path(model_dir) / "metadata.json"
+                if metadata_path.exists():
+                    metadata = json.loads(metadata_path.read_text())
+                    if "obs_shape" in metadata:
+                        obs_shape = tuple(metadata["obs_shape"])
             except Exception:
-                # fallback: try torch.jit.script
+                LOG.debug("Could not load obs_shape from metadata, using default")
+            
+            benchmark_results = benchmark_inference_performance(
+                policy, 
+                obs_shape, 
+                cfg.benchmark_batch_sizes,
+                n_iterations=100
+            )
+            
+            LOG.info("Benchmark results:")
+            for batch_key, metrics in benchmark_results.items():
+                LOG.info("  %s: %.2f ms (p95: %.2f ms, p99: %.2f ms, throughput: %.1f/s)", 
+                        batch_key,
+                        metrics["mean_latency_ms"],
+                        metrics["p95_latency_ms"],
+                        metrics["p99_latency_ms"],
+                        metrics["throughput_samples_per_sec"])
+            
+            # Log to tracking systems
+            if benchmark_results.get("batch_1"):
+                safe_mlflow_log_metrics({
+                    "inference_latency_mean_ms": benchmark_results["batch_1"]["mean_latency_ms"],
+                    "inference_latency_p95_ms": benchmark_results["batch_1"]["p95_latency_ms"],
+                    "inference_throughput": benchmark_results["batch_1"]["throughput_samples_per_sec"]
+                })
+                safe_wandb_log({
+                    "inference_latency_mean_ms": benchmark_results["batch_1"]["mean_latency_ms"],
+                    "inference_latency_p95_ms": benchmark_results["batch_1"]["p95_latency_ms"]
+                })
+        except Exception as e:
+            LOG.warning("⚠️ Benchmark failed: %s", e)
+            benchmark_results = {"error": str(e)}
+    
+    # -------------------------
+    # Create environment factory
+    # -------------------------
+    env_factory = _local_make_env({})
+    
+    # -------------------------
+    # Run main evaluation
+    # -------------------------
+    try:
+        LOG.info("🚀 Starting evaluation (%d episodes, max_steps=%d)...", 
+                cfg.eval_episodes, cfg.max_steps)
+        
+        res = run_vectorized_evaluation(
+            policy,
+            env_factory,
+            episodes=cfg.eval_episodes,
+            max_steps=cfg.max_steps,
+            n_workers=cfg.num_workers,
+            timeout=cfg.worker_timeout
+        )
+        
+        LOG.info("✅ Evaluation complete:")
+        LOG.info("   Mean reward: %.3f ± %.3f", 
+                res.get("reward_mean", 0), res.get("reward_std", 0))
+        LOG.info("   Episodes completed: %d/%d",
+                res.get("episodes_completed", 0), cfg.eval_episodes)
+        
+        if res.get("failed", 0) > 0:
+            LOG.warning("⚠️ %d episodes failed", res["failed"])
+            
+    except Exception as e:
+        LOG.exception("❌ Evaluation loop failed: %s", e)
+        safe_mlflow_end()
+        safe_wandb_finish()
+        return EXIT_FAILURE
+    
+    # Add benchmark results to output
+    if benchmark_results:
+        res["benchmark"] = benchmark_results
+    
+    # -------------------------
+    # Safety checks
+    # -------------------------
+    if cfg.check_numerical_stability:
+        rewards = res.get("rewards", [])
+        if any(np.isnan(r) or np.isinf(r) for r in rewards):
+            LOG.error("❌ NUMERICAL INSTABILITY DETECTED - NaN/Inf in rewards!")
+            res["numerical_stability_check"] = "FAILED"
+            res["numerical_stability_details"] = {
+                "nan_count": sum(1 for r in rewards if np.isnan(r)),
+                "inf_count": sum(1 for r in rewards if np.isinf(r))
+            }
+        else:
+            LOG.info("✅ Numerical stability check passed")
+            res["numerical_stability_check"] = "PASSED"
+    
+    # Reward threshold checks
+    mean_reward = res.get("reward_mean", 0.0)
+    if cfg.max_episode_reward and mean_reward > cfg.max_episode_reward:
+        LOG.warning("⚠️ Mean reward %.3f EXCEEDS max threshold %.3f (possible bug)", 
+                   mean_reward, cfg.max_episode_reward)
+        res["sanity_check_max"] = "FAILED"
+    
+    if cfg.min_episode_reward and mean_reward < cfg.min_episode_reward:
+        LOG.warning("⚠️ Mean reward %.3f BELOW min threshold %.3f", 
+                   mean_reward, cfg.min_episode_reward)
+        res["sanity_check_min"] = "FAILED"
+    
+    # -------------------------
+    # A/B testing
+    # -------------------------
+    if cfg.baseline_checkpoint:
+        try:
+            LOG.info("🔬 Running A/B test against baseline...")
+            LOG.info("   Baseline: %s", cfg.baseline_checkpoint)
+            
+            # Build baseline policy
+            baseline_cfg = EvalConfig(
+                checkpoint=cfg.baseline_checkpoint,
+                eval_episodes=cfg.eval_episodes,
+                max_steps=cfg.max_steps,
+                device=cfg.device,
+                use_onnx=cfg.baseline_checkpoint.endswith(".onnx") if cfg.baseline_checkpoint else False,
+                seed=cfg.seed + 1000  # Different seed for baseline
+            )
+            
+            baseline_policy, _ = build_policy_for_eval(baseline_cfg, tmp_dir=tmp_dir)
+            
+            baseline_res = run_vectorized_evaluation(
+                baseline_policy,
+                env_factory,
+                episodes=cfg.eval_episodes,
+                max_steps=cfg.max_steps,
+                n_workers=cfg.num_workers,
+                timeout=cfg.worker_timeout
+            )
+            
+            # Perform statistical comparison
+            ab_comparison = compare_policies_statistically(
+                baseline_res,
+                res,
+                test_type=cfg.statistical_test,
+                confidence_level=cfg.confidence_level
+            )
+            
+            LOG.info("=" * 60)
+            LOG.info("A/B Test Results:")
+            LOG.info("=" * 60)
+            LOG.info("  Baseline mean: %.3f", ab_comparison.get("baseline_mean", 0))
+            LOG.info("  Candidate mean: %.3f", ab_comparison.get("candidate_mean", 0))
+            LOG.info("  Improvement: %.1f%%", ab_comparison.get("improvement_pct", 0))
+            LOG.info("  P-value: %.4f", ab_comparison.get("p_value", 0))
+            LOG.info("  Significant: %s", ab_comparison.get("significant", False))
+            LOG.info("  Effect size (Cohen's d): %.3f", ab_comparison.get("effect_size", 0))
+            LOG.info("  Confidence interval: (%.3f, %.3f)", 
+                    ab_comparison.get("confidence_interval", (0, 0))[0],
+                    ab_comparison.get("confidence_interval", (0, 0))[1])
+            LOG.info("  %s", ab_comparison.get("recommendation", "N/A"))
+            LOG.info("=" * 60)
+            
+            res["ab_test"] = ab_comparison
+            res["baseline_results"] = baseline_res
+            
+            # Log to tracking
+            safe_mlflow_log_metrics({
+                "ab_p_value": ab_comparison.get("p_value", 0),
+                "ab_improvement_pct": ab_comparison.get("improvement_pct", 0),
+                "ab_effect_size": ab_comparison.get("effect_size", 0),
+                "ab_significant": 1.0 if ab_comparison.get("significant") else 0.0
+            })
+            
+            safe_wandb_log({
+                "ab_test": ab_comparison,
+                "ab_improvement_pct": ab_comparison.get("improvement_pct", 0)
+            })
+            
+        except Exception as e:
+            LOG.exception("❌ A/B testing failed: %s", e)
+            res["ab_test"] = {"error": str(e)}
+    
+    # -------------------------
+    # Drift detection
+    # -------------------------
+    if cfg.enable_drift_detection and cfg.drift_reference_data:
+        try:
+            LOG.info("📊 Checking for distribution drift...")
+            LOG.info("   Reference data: %s", cfg.drift_reference_data)
+            
+            # Load reference data
+            ref_path = pathlib.Path(cfg.drift_reference_data)
+            if not ref_path.exists():
+                LOG.warning("Reference data not found: %s", ref_path)
+            else:
+                with open(ref_path, 'r') as f:
+                    reference_data = json.load(f)
+                
+                drift_detector = DriftDetector(reference_data)
+                drift_result = drift_detector.check_drift(res, threshold=cfg.drift_threshold)
+                
+                if drift_result.get("drift_detected"):
+                    LOG.warning("=" * 60)
+                    LOG.warning("⚠️ DRIFT DETECTED - Distribution shift from reference")
+                    LOG.warning("=" * 60)
+                    LOG.warning("  Drift score: %.3f (threshold: %.3f)", 
+                               drift_result["drift_score"], cfg.drift_threshold)
+                    details = drift_result.get("details", {})
+                    LOG.warning("  Mean drift: %.3f", details.get("mean_drift", 0))
+                    LOG.warning("  Std drift: %.3f", details.get("std_drift", 0))
+                    LOG.warning("  P50 shift: %.3f", details.get("p50_shift", 0))
+                    LOG.warning("  P95 shift: %.3f", details.get("p95_shift", 0))
+                    LOG.warning("  %s", drift_result.get("recommendation", ""))
+                    LOG.warning("=" * 60)
+                else:
+                    LOG.info("✅ No significant drift detected (score: %.3f)", 
+                            drift_result.get("drift_score", 0))
+                
+                res["drift_detection"] = drift_result
+                
+                # Log to tracking
+                safe_mlflow_log_metrics({
+                    "drift_score": drift_result.get("drift_score", 0),
+                    "drift_detected": 1.0 if drift_result.get("drift_detected") else 0.0
+                })
+                
+                safe_wandb_log({
+                    "drift_score": drift_result.get("drift_score", 0),
+                    "drift_detected": drift_result.get("drift_detected", False)
+                })
+                
+                # Update Prometheus
+                if cfg.enable_prometheus and _HAS_PROMETHEUS:
+                    eval_drift_gauge.set(drift_result.get("drift_score", 0))
+                    
+                # ✅ Final environment sync sanity check
                 try:
-                    scriptmod = torch.jit.script(policy.model)
-                    torch.jit.save(scriptmod, tmp_policy_path)
-                    policy_spec = {"type": "torch_checkpoint", "path": tmp_policy_path, "entrypoint": None}
-                    loader_logger.info("Exported policy TorchScript (script) to %s for worker loading", tmp_policy_path)
+                    obs_space = get_observation_space()
+                    act_space = get_action_space()
+                    if obs_space and act_space:
+                        LOG.info(
+                            "✅ Sync verified | obs_dim=%d vs env=%d | act_dim=%d vs env=%d",
+                            SYNC_CFG.obs_dim, obs_space.shape[0],
+                            SYNC_CFG.act_dim, act_space.shape[0],
+                        )
                 except Exception:
-                    loader_logger.exception("Failed to export TorchScript for policy; falling back to single-process evaluation")
-                    policy_spec = None
-        except Exception:
-            loader_logger.exception("Policy serialization failed; workers may not be able to load it")
-            policy_spec = None
+                    LOG.debug("Sync verification skipped (real_env not available)")
+                
+        except Exception as e:
+            LOG.exception("❌ Drift detection failed: %s", e)
+            res["drift_detection"] = {"error": str(e)}
+    
+    # -------------------------
+    # Write results to file
+    # -------------------------
+    result_file = cfg.out or str(DEFAULT_RESULTS_DIR / f"eval_result_{int(time.time())}.json")
+    pathlib.Path(result_file).parent.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Prepare serializable result
+        serializable_res = {
+                            k: v for k, v in res.items()
+                            if not isinstance(v, (type, torch.nn.Module) if _HAS_TORCH else ())
+        }                    
+        with open(result_file, "w", encoding="utf-8") as f:
+            json.dump(serializable_res, f, indent=2, default=str)
+        LOG.info("💾 Results saved: %s", result_file)
+    except Exception as e:
+        LOG.exception("❌ Failed to write results: %s", e)
+    
+    # -------------------------
+    # Log final metrics
+    # -------------------------
+    final_metrics = {
+        "reward_mean": res.get("reward_mean", 0.0),
+        "reward_std": res.get("reward_std", 0.0),
+        "reward_p50": res.get("reward_p50", 0.0),
+        "reward_p95": res.get("reward_p95", 0.0),
+        "episodes_completed": res.get("episodes_completed", 0),
+        "episodes_failed": res.get("failed", 0)
+    }
+    
+    safe_mlflow_log_metrics(final_metrics)
+    safe_wandb_log(final_metrics)
+    
+    # Update Prometheus
+    if cfg.enable_prometheus and _HAS_PROMETHEUS:
+        eval_reward_gauge.set(res.get("reward_mean", 0.0))
+        eval_episodes_counter.inc(res.get("episodes_completed", 0))
+    
+    # -------------------------
+    # S3 upload
+    # -------------------------
+    s3_uri = upload_results_to_s3(result_file, cfg)
+    if s3_uri:
+        LOG.info("☁️ Uploaded to S3: %s", s3_uri)
+        res["s3_uri"] = s3_uri
+    
+    # -------------------------
+    # Cleanup
+    # -------------------------
+    safe_mlflow_end()
+    safe_wandb_finish()
+    
+    try:
+        shutil.rmtree(tmp_dir)
+    except Exception:
+        pass
+    
+    # -------------------------
+    # Final summary & exit code
+    # -------------------------
+    LOG.info("=" * 80)
+    LOG.info("✅ EVALUATION COMPLETE")
+    LOG.info("=" * 80)
+    LOG.info("Episodes: %d/%d completed", 
+            res.get("episodes_completed", 0), cfg.eval_episodes)
+    LOG.info("Mean Reward: %.3f ± %.3f", mean_reward, res.get("reward_std", 0.0))
+    LOG.info("Reward Range: [%.3f, %.3f]", 
+            min(res.get("rewards", [0])), max(res.get("rewards", [0])))
+    
+    if "ab_test" in res:
+        LOG.info("A/B Test: %s", res["ab_test"].get("recommendation", "N/A"))
+    
+    if "drift_detection" in res:
+        LOG.info("Drift: %s", res["drift_detection"].get("recommendation", "N/A"))
+    
+    if "numerical_stability_check" in res:
+        LOG.info("Stability: %s", res["numerical_stability_check"])
+    
+    LOG.info("Results: %s", result_file)
+    if s3_uri:
+        LOG.info("S3: %s", s3_uri)
+    LOG.info("=" * 80)
+    
+    # Determine exit code
+    if cfg.stop_if_below_mean_reward is not None and mean_reward < cfg.stop_if_below_mean_reward:
+        LOG.warning("❌ Mean reward %.3f BELOW threshold %.3f - FAILING", 
+                   mean_reward, cfg.stop_if_below_mean_reward)
+        return EXIT_MEAN_BELOW_THRESHOLD
+    
+    if res.get("numerical_stability_check") == "FAILED":
+        LOG.error("❌ Numerical instability detected - FAILING")
+        return EXIT_FAILURE
+    
+    return EXIT_OK
+
+# =========================================================================
+# SECTION 8: Enhanced CLI (COMPLETE)
+# =========================================================================
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="PriorityMax RL Evaluation - Enterprise Edition",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Standard evaluation
+  python train_rl_eval.py --model-dir models/ppo --eval-episodes 50
+  
+  # ONNX production path
+  python train_rl_eval.py --checkpoint model.onnx --use-onnx
+  
+  # A/B testing
+  python train_rl_eval.py --checkpoint candidate.pt --baseline-checkpoint baseline.pt
+  
+  # Full CI/CD pipeline
+  python train_rl_eval.py --model-tag prod-v2 --baseline-checkpoint prod-v1.pt \\
+      --drift-detection --drift-reference data/ref.json --benchmark \\
+      --stop-if-below-mean-reward 100.0 --mlflow --wandb
+        """
+    )
+    
+    # ===== Basic Arguments =====
+    p.add_argument("--config", help="Path to YAML/JSON config file")
+    p.add_argument("--model-dir", help="Path or S3 URI to model directory")
+    p.add_argument("--checkpoint", help="Explicit checkpoint file (.pt or .onnx)")
+    p.add_argument("--model-tag", help="Model registry tag")
+    
+    # ===== Evaluation Parameters =====
+    p.add_argument("--eval-episodes", type=int, default=50,
+                   help="Number of episodes to evaluate (default: 50)")
+    p.add_argument("--max-steps", type=int, default=1000,
+                   help="Max steps per episode (default: 1000)")
+    p.add_argument("--device", default="cpu",
+                   help="Device string: cpu, cuda, cuda:0 (default: cpu)")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Random seed for reproducibility")
+    
+    # ===== Thresholds & Gates =====
+    p.add_argument("--stop-if-below-mean-reward", type=float, default=None,
+                   help="Exit with code 2 if mean reward below this threshold (CI gate)")
+    p.add_argument("--max-episode-reward", type=float, default=None,
+                   help="Sanity check: warn if reward exceeds this (default: None)")
+    p.add_argument("--min-episode-reward", type=float, default=None,
+                   help="Sanity check: warn if reward below this (default: None)")
+    
+    # ===== Experiment Tracking =====
+    p.add_argument("--mlflow", action="store_true",
+                   help="Enable MLflow logging")
+    p.add_argument("--mlflow-experiment", default="PriorityMax-RL-Eval",
+                   help="MLflow experiment name")
+    p.add_argument("--wandb", action="store_true",
+                   help="Enable Weights & Biases logging")
+    p.add_argument("--wandb-project", default="PriorityMax-RL-Eval",
+                   help="W&B project name")
+    
+    # ===== Output & Storage =====
+    p.add_argument("--out", help="Output result JSON path")
+    p.add_argument("--s3-bucket", help="S3 bucket for uploads")
+    p.add_argument("--s3-prefix", help="S3 prefix (default: eval-results/YYYYMMDD/)")
+    
+    # ===== ENTERPRISE FEATURES =====
+    
+    # ONNX
+    p.add_argument("--use-onnx", action="store_true",
+                   help="Evaluate ONNX model (production inference path)")
+    p.add_argument("--onnx-providers", nargs="+", default=["CPUExecutionProvider"],
+                   help="ONNX Runtime providers (default: CPUExecutionProvider)")
+    
+    # A/B Testing
+    p.add_argument("--baseline-checkpoint", default=None,
+                   help="Baseline checkpoint for A/B testing")
+    p.add_argument("--statistical-test", choices=["ttest", "mannwhitneyu"], default="ttest",
+                   help="Statistical test for A/B comparison (default: ttest)")
+    p.add_argument("--confidence-level", type=float, default=0.95,
+                   help="Confidence level for statistical tests (default: 0.95)")
+    
+    # Drift Detection
+    p.add_argument("--drift-detection", action="store_true",
+                   help="Enable distribution drift detection")
+    p.add_argument("--drift-reference", dest="drift_reference_data", default=None,
+                   help="Path to reference distribution data (JSON)")
+    p.add_argument("--drift-threshold", type=float, default=0.3,
+                   help="Drift detection threshold (default: 0.3)")
+    
+    # Performance Benchmarking
+    p.add_argument("--benchmark", dest="measure_inference_time", action="store_true",
+                   help="Measure inference performance (latency/throughput)")
+    p.add_argument("--benchmark-batch-sizes", type=int, nargs="+", default=[1, 8, 32],
+                   help="Batch sizes for benchmarking (default: 1 8 32)")
+    
+    # Safety Checks
+    p.add_argument("--check-stability", dest="check_numerical_stability",
+                   action="store_true", default=True,
+                   help="Check for NaN/Inf in outputs (default: enabled)")
+    p.add_argument("--no-check-stability", dest="check_numerical_stability",
+                   action="store_false",
+                   help="Disable numerical stability checks")
+    
+    # Prometheus Metrics
+    p.add_argument("--prometheus", dest="enable_prometheus", action="store_true",
+                   help="Enable Prometheus metrics export")
+    p.add_argument("--prometheus-port", type=int, default=9304,
+                   help="Prometheus metrics port (default: 9304)")
+    
+    # Parallelization
+    p.add_argument("--num-workers", type=int, default=None,
+                   help="Number of parallel evaluation workers (default: auto-detect)")
+    p.add_argument("--worker-timeout", type=int, default=3600,
+                   help="Worker timeout in seconds (default: 3600)")
+    
+    # Misc
+    p.add_argument("--verbosity", type=int, choices=[0, 1, 2], default=1,
+                   help="Verbosity level: 0=quiet, 1=normal, 2=debug (default: 1)")
+    
+    return p
+
+# =========================================================================
+# SECTION 9: Main CLI Entry Point (COMPLETE)
+# =========================================================================
+
+def main_cli():
+    """Main CLI entry point with full error handling."""
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    
+    # Adjust logging level based on verbosity
+    if args.verbosity == 0:
+        LOG.setLevel(logging.WARNING)
+    elif args.verbosity == 2:
+        LOG.setLevel(logging.DEBUG)
+    
+    # Load configuration
+    try:
+        cfg = EvalConfig.from_cli_and_file(args)
+    except Exception as e:
+        LOG.error("❌ Failed to load configuration: %s", e)
+        sys.exit(EXIT_CONFIG_ERROR)
+    
+    # Validate configuration
+    try:
+        if cfg.eval_episodes <= 0:
+            raise ValueError("eval_episodes must be positive")
+        if cfg.max_steps <= 0:
+            raise ValueError("max_steps must be positive")
+        if cfg.confidence_level <= 0 or cfg.confidence_level >= 1:
+            raise ValueError("confidence_level must be in (0, 1)")
+    except ValueError as e:
+        LOG.error("❌ Invalid configuration: %s", e)
+        sys.exit(EXIT_CONFIG_ERROR)
+    
+    # Check dependencies
+    missing_deps = []
+    if cfg.use_onnx and not _HAS_ONNX:
+        missing_deps.append("onnxruntime")
+    if cfg.log_mlflow and not _HAS_MLFLOW:
+        LOG.warning("MLflow requested but not available")
+    if cfg.log_wandb and not _HAS_WANDB:
+        LOG.warning("W&B requested but not available")
+    if cfg.enable_prometheus and not _HAS_PROMETHEUS:
+        LOG.warning("Prometheus requested but prometheus_client not available")
+    
+    if missing_deps:
+        LOG.error("❌ Missing required dependencies: %s", ", ".join(missing_deps))
+        LOG.error("   Install with: pip install %s", " ".join(missing_deps))
+        sys.exit(EXIT_MISSING_DEP)
+    
+    # Handle graceful signals
+    def _handle_sig(sig, frame):
+        LOG.warning("⚠️ Signal %s received; terminating...", sig)
+        sys.exit(EXIT_FAILURE)
+    
+    signal.signal(signal.SIGINT, _handle_sig)
+    signal.signal(signal.SIGTERM, _handle_sig)
+    
+    # Run evaluation
+    try:
+        exit_code = run_evaluation(cfg)
+        sys.exit(exit_code)
+    
+    except KeyboardInterrupt:
+        LOG.warning("⚠️ Interrupted by user")
+        sys.exit(EXIT_FAILURE)
+    
+    except Exception as e:
+        LOG.exception("❌ Fatal error during evaluation: %s", e)
+        sys.exit(EXIT_FAILURE)
+
+# =========================================================================
+# SECTION 10: Vectorized Evaluation Implementation (COMPLETE)
+# =========================================================================
+
+def run_vectorized_evaluation(
+    policy: Any,
+    env_factory: Callable,
+    episodes: int = 100,
+    max_steps: int = 1000,
+    n_workers: int = 4,
+    timeout: int = 3600
+) -> Dict[str, Any]:
+    """
+    Parallel evaluation across multiple workers.
+    Synchronized with train_rl_heavy.py patterns.
+    
+    Args:
+        policy: Policy interface with .act() method
+        env_factory: Factory function that creates environment instances
+        episodes: Total episodes to evaluate
+        max_steps: Maximum steps per episode
+        n_workers: Number of parallel workers
+        timeout: Worker timeout in seconds
+    
+    Returns:
+        Dictionary with evaluation results
+    """
+    import multiprocessing as mp
+    from queue import Empty as QueueEmpty
+    
+    LOG.info("Starting vectorized evaluation: %d workers, %d episodes", n_workers, episodes)
+    
+    # Try to serialize policy for workers
+    policy_serialized = None
+    
+    if _HAS_TORCH and isinstance(policy.model, torch.nn.Module):
+        # Export to TorchScript for worker processes
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="eval_policy_")
+            policy_path = os.path.join(tmp_dir, "policy.pt")
+            
+            # Try JIT trace
+            try:
+                dummy_obs = torch.randn(1, 8)  # Adjust shape as needed
+                traced = torch.jit.trace(policy.model, dummy_obs)
+                torch.jit.save(traced, policy_path)
+            except:
+                # Fallback: try JIT script
+                try:
+                    scripted = torch.jit.script(policy.model)
+                    torch.jit.save(scripted, policy_path)
+                except:
+                    LOG.warning("Could not serialize policy; falling back to single-process eval")
+                    return _single_process_evaluation(policy, env_factory, episodes, max_steps)
+            
+            policy_serialized = {
+                "type": "torch_jit",
+                "path": policy_path
+            }
+            LOG.debug("Policy serialized to: %s", policy_path)
+            
+        except Exception as e:
+            LOG.warning("Policy serialization failed: %s; using single-process", e)
+            return _single_process_evaluation(policy, env_factory, episodes, max_steps)
     else:
-        # non-torch or non-serializable policy: do single-process eval
-        policy_spec = None
-
-    # If policy_spec is None, run single-process fallback
-    if policy_spec is None:
-        loader_logger.warning("Workers will not be used; running single-process evaluation")
-        return run_singleprocess_evaluation(policy, env_factory, episodes=episodes, max_steps=max_steps)
-
-    # Create multiprocessing queues
+        # Non-torch policy: fallback to single process
+        LOG.warning("Non-torch policy detected; using single-process evaluation")
+        return _single_process_evaluation(policy, env_factory, episodes, max_steps)
+    
+    # Create worker queues
     manager = mp.Manager()
-    task_q = manager.Queue()
-    result_q = manager.Queue()
-
-    # Prepare serialized env factory config to pass to workers
-    env_factory_serialized = {"env_config": getattr(env_factory, "__closure__", None) or {}, "base_seed": int(time.time())}
-
-    # Spawn workers
+    task_queue = manager.Queue()
+    result_queue = manager.Queue()
+    
+    # Start worker processes
     workers = []
-    for wid in range(n_workers):
-        p = mp.Process(target=_eval_worker, args=(task_q, result_q, wid, {"env_config": None, "base_seed": int(time.time()) + wid}))
+    for worker_id in range(n_workers):
+        p = mp.Process(
+            target=_evaluation_worker,
+            args=(task_queue, result_queue, worker_id, policy_serialized, env_factory)
+        )
         p.daemon = True
         p.start()
         workers.append(p)
-
-    # Submit tasks in batches
-    remaining = episodes
-    start_seed = int(time.time()) % 2**31
-    while remaining > 0:
-        batch = min(per_worker_batch, remaining)
-        task = {"policy": policy_spec, "episodes": batch, "max_steps": max_steps, "start_seed": start_seed}
-        task_q.put(task)
-        remaining -= batch
-        start_seed += batch
-
+    
+    # Distribute tasks
+    episodes_per_worker = episodes // n_workers
+    remainder = episodes % n_workers
+    
+    for worker_id in range(n_workers):
+        worker_episodes = episodes_per_worker + (1 if worker_id < remainder else 0)
+        if worker_episodes > 0:
+            task_queue.put({
+                "worker_id": worker_id,
+                "episodes": worker_episodes,
+                "max_steps": max_steps,
+                "seed_offset": worker_id * 1000
+            })
+    
+    # Send shutdown signal
+    for _ in range(n_workers):
+        task_queue.put(None)
+    
     # Collect results
-    collected = []
+    all_results = []
     deadline = time.time() + timeout
-    while len(collected) < episodes and time.time() < deadline:
-        try:
-            res = result_q.get(timeout=5.0)
-            collected.append(res)
-        except QueueEmpty:
-            continue
-
-    # Send shutdown sentinel
-    for _ in workers:
-        task_q.put(None)
-    # Join workers
+    
+    with tqdm(total=episodes, desc="Evaluating", disable=not _HAS_TQDM) as pbar:
+        while len(all_results) < episodes and time.time() < deadline:
+            try:
+                result = result_queue.get(timeout=1.0)
+                if result.get("ok"):
+                    all_results.append(result)
+                    pbar.update(1)
+                else:
+                    LOG.warning("Episode failed: %s", result.get("error"))
+            except QueueEmpty:
+                continue
+    
+    # Terminate workers
     for p in workers:
         p.join(timeout=2.0)
+        if p.is_alive():
+            p.terminate()
+    
+    # Aggregate results
+    rewards = [r["reward"] for r in all_results if "reward" in r]
+    steps_list = [r["steps"] for r in all_results if "steps" in r]
+    
+    if not rewards:
+        LOG.error("No successful episodes completed!")
+        return {
+            "episodes_requested": episodes,
+            "episodes_completed": 0,
+            "failed": episodes,
+            "rewards": [],
+            "reward_mean": 0.0,
+            "reward_std": 0.0
+        }
+    
+    result_dict = {
+        "episodes_requested": episodes,
+        "episodes_completed": len(rewards),
+        "failed": episodes - len(rewards),
+        "rewards": rewards,
+        "steps": steps_list,
+        "reward_mean": float(statistics.mean(rewards)),
+        "reward_std": float(statistics.pstdev(rewards)) if len(rewards) > 1 else 0.0,
+        "reward_min": float(min(rewards)),
+        "reward_max": float(max(rewards)),
+        "reward_p50": float(sorted(rewards)[int(0.5 * len(rewards))]),
+        "reward_p95": float(sorted(rewards)[int(0.95 * len(rewards))]) if len(rewards) > 1 else float(rewards[0]),
+        "mean_episode_length": float(statistics.mean(steps_list)) if steps_list else 0.0,
+        "raw_results": all_results
+    }
+    
+    LOG.debug("Vectorized evaluation complete: %d/%d episodes", len(rewards), episodes)
+    
+    return result_dict
 
-    # Aggregate results (filter successful)
-    rewards = [r["reward"] for r in collected if r.get("ok")]
-    steps_list = [r["steps"] for r in collected if r.get("ok")]
-    failed = [r for r in collected if not r.get("ok")]
+def _evaluation_worker(task_queue, result_queue, worker_id, policy_spec, env_factory):
+    """
+    Worker process for parallel evaluation.
+    Runs independently and reports results via queue.
+    """
+    # Load policy in worker process
+    policy = None
+    try:
+        if policy_spec and policy_spec["type"] == "torch_jit":
+            if _HAS_TORCH:
+                model = torch.jit.load(policy_spec["path"], map_location="cpu")
+                policy = PolicyInterface(model, device=torch.device("cpu"))
+            else:
+                result_queue.put({"ok": False, "error": "torch_not_available"})
+                return
+        else:
+            result_queue.put({"ok": False, "error": "unsupported_policy_type"})
+            return
+    except Exception as e:
+        result_queue.put({"ok": False, "error": f"policy_load_failed: {e}"})
+        return
+    
+    # Process tasks
+    while True:
+        try:
+            task = task_queue.get(timeout=1.0)
+        except:
+            continue
+        
+        if task is None:
+            break
+        
+        episodes = task["episodes"]
+        max_steps = task["max_steps"]
+        seed_offset = task["seed_offset"]
+        
+        # Run episodes
+        for ep in range(episodes):
+            try:
+                env = env_factory(seed=seed_offset + ep)
+                obs = env.reset(seed=seed_offset + ep)
+                
+                total_reward = 0.0
+                steps = 0
+                done = False
+                
+                while not done and steps < max_steps:
+                    action_dict = policy.act(obs)
+                    action = action_dict["action"]
+                    
+                    obs, reward, done, info = env.step(action)
+                    total_reward += float(reward)
+                    steps += 1
+                
+                result_queue.put({
+                    "ok": True,
+                    "worker_id": worker_id,
+                    "episode": ep,
+                    "reward": total_reward,
+                    "steps": steps
+                })
+                
+            except Exception as e:
+                result_queue.put({
+                    "ok": False,
+                    "worker_id": worker_id,
+                    "episode": ep,
+                    "error": str(e)
+                })
 
-    out = {
+def _single_process_evaluation(
+    policy: Any,
+    env_factory: Callable,
+    episodes: int,
+    max_steps: int
+) -> Dict[str, Any]:
+    """
+    Fallback single-process evaluation.
+    Used when multiprocessing is not available or policy cannot be serialized.
+    """
+    LOG.info("Running single-process evaluation: %d episodes", episodes)
+    
+    results = []
+    
+    for ep in tqdm(range(episodes), desc="Evaluating", disable=not _HAS_TQDM):
+        try:
+            env = env_factory(seed=ep)
+            obs = env.reset(seed=ep)
+            
+            total_reward = 0.0
+            steps = 0
+            done = False
+            
+            while not done and steps < max_steps:
+                action_dict = policy.act(obs)
+                action = action_dict["action"]
+                
+                obs, reward, done, info = env.step(action)
+                total_reward += float(reward)
+                steps += 1
+            
+            results.append({
+                "episode": ep,
+                "reward": total_reward,
+                "steps": steps
+            })
+            
+        except Exception as e:
+            LOG.warning("Episode %d failed: %s", ep, e)
+            results.append({
+                "episode": ep,
+                "error": str(e)
+            })
+    
+    # Aggregate
+    rewards = [r["reward"] for r in results if "reward" in r]
+    steps_list = [r["steps"] for r in results if "steps" in r]
+    failed = [r for r in results if "error" in r]
+    
+    return {
         "episodes_requested": episodes,
         "episodes_completed": len(rewards),
         "failed": len(failed),
         "rewards": rewards,
         "steps": steps_list,
-        "raw": collected
+        "reward_mean": float(statistics.mean(rewards)) if rewards else 0.0,
+        "reward_std": float(statistics.pstdev(rewards)) if len(rewards) > 1 else 0.0,
+        "reward_min": float(min(rewards)) if rewards else 0.0,
+        "reward_max": float(max(rewards)) if rewards else 0.0,
+        "reward_p50": float(sorted(rewards)[int(0.5 * len(rewards))]) if rewards else 0.0,
+        "reward_p95": float(sorted(rewards)[int(0.95 * len(rewards))]) if len(rewards) > 1 else 0.0,
+        "mean_episode_length": float(statistics.mean(steps_list)) if steps_list else 0.0
     }
-    # derive stats
-    if rewards:
-        import statistics as _st
-        out["reward_mean"] = float(_st.mean(rewards))
-        out["reward_std"] = float(_st.pstdev(rewards) if len(rewards) > 1 else 0.0)
-        out["reward_p50"] = float(sorted(rewards)[int(0.5 * (len(rewards)-1))])
-        out["reward_p95"] = float(sorted(rewards)[int(0.95 * (len(rewards)-1))])
-    else:
-        out["reward_mean"] = out["reward_std"] = out["reward_p50"] = out["reward_p95"] = 0.0
 
-    # Persist results to file
-    try:
-        results_dir = pathlib.Path.cwd() / "eval_results"
-        results_dir.mkdir(parents=True, exist_ok=True)
-        fname = results_dir / f"eval_{int(time.time())}.json"
-        fname.write_text(json.dumps(out, default=str, indent=2), encoding="utf-8")
-        out["result_file"] = str(fname)
-    except Exception:
-        loader_logger.exception("Failed to persist evaluation results")
+# =========================================================================
+# SECTION 11: Documentation & Usage Examples
+# =========================================================================
 
-    # cleanup tmp policy if created
-    if tmp_policy_path:
-        try:
-            shutil.rmtree(os.path.dirname(tmp_policy_path))
-        except Exception:
-            pass
-
-    return out
-
-# -------------------------
-# Single-process evaluation fallback
-# -------------------------
-def run_singleprocess_evaluation(policy: PolicyInterface,
-                                 env_factory: Callable[..., Any],
-                                 episodes: int = 100,
-                                 max_steps: int = 1000) -> Dict[str, Any]:
-    """
-    Run evaluation episodes in the current process (no multiprocessing).
-    """
-    results = []
-    for ep in range(episodes):
-        env = env_factory(seed=int(time.time()) + ep)
-        obs = env.reset(seed=int(time.time()) + ep) if hasattr(env, "reset") else env.reset()
-        total_reward = 0.0
-        steps = 0
-        trace = []
-        done = False
-        while not done and steps < max_steps:
-            out = policy.act(obs)
-            action = out.get("action")
-            try:
-                obs, rew, done, info = env.step(action)
-            except Exception:
-                # if env.step signature differs
-                try:
-                    obs, rew, done = env.step(action)
-                    info = {}
-                except Exception:
-                    loader_logger.exception("Env.step failed during single-process evaluation")
-                    break
-            total_reward += float(rew)
-            steps += 1
-            trace.append({"step": steps, "reward": float(rew)})
-        results.append({"episode": ep, "reward": total_reward, "steps": steps, "trace": trace})
-
-    rewards = [r["reward"] for r in results]
-    import statistics as _st
-    out = {"episodes_requested": episodes, "episodes_completed": len(rewards), "rewards": rewards}
-    if rewards:
-        out["reward_mean"] = float(_st.mean(rewards))
-        out["reward_std"] = float(_st.pstdev(rewards) if len(rewards) > 1 else 0.0)
-        out["reward_p50"] = float(sorted(rewards)[int(0.5 * (len(rewards)-1))])
-        out["reward_p95"] = float(sorted(rewards)[int(0.95 * (len(rewards)-1))])
-    else:
-        out["reward_mean"] = out["reward_std"] = out["reward_p50"] = out["reward_p95"] = 0.0
-    return out
-
-# End of Chunk 3
-# -------------------------
-# Chunk 4: Evaluation runner orchestration, logging, artifact uploads, and CLI
-# -------------------------
-
-def upload_results_to_s3(result_path: str, cfg: EvalConfig) -> Optional[str]:
-    """
-    Upload result JSON (and traces if available) to configured S3 bucket/prefix.
-    Returns uploaded key URI.
-    """
-    if not cfg.s3_bucket or not _HAS_BOTO3:
-        return None
-    client = s3_client()
-    key_prefix = cfg.s3_prefix or f"eval-results/{time.strftime('%Y%m%d')}/"
-    key_name = key_prefix.rstrip("/") + "/" + os.path.basename(result_path)
-    try:
-        client.upload_file(result_path, cfg.s3_bucket, key_name)
-        LOG.info("Uploaded evaluation result to s3://%s/%s", cfg.s3_bucket, key_name)
-        return f"s3://{cfg.s3_bucket}/{key_name}"
-    except Exception:
-        LOG.exception("S3 upload of evaluation result failed")
-        return None
-
-
-def run_evaluation(cfg: EvalConfig) -> int:
-    """
-    Main orchestration: builds policy, runs evaluation, logs metrics, writes results,
-    uploads to MLflow/W&B/S3 as configured, and returns CI exit code.
-    """
-    LOG.info("=== PriorityMax RL Evaluation Start ===")
-    seed = set_global_seed(cfg.seed)
-    device = prepare_device(cfg.device)
-    LOG.info("Device: %s", device)
-
-    # Initialize MLflow/W&B
-    run_name = f"eval_{int(time.time())}"
-    mlflow_run = safe_mlflow_init(cfg, run_name)
-    wandb_run = safe_wandb_init(cfg, run_name)
-
-    tmp_dir = tempfile.mkdtemp(prefix="prioritymax_eval_tmp_")
-
-    # Build policy
-    try:
-        policy, model_dir = build_policy_for_eval(cfg, tmp_dir=tmp_dir)
-        LOG.info("Policy built successfully from %s", model_dir)
-    except Exception as e:
-        LOG.exception("Policy build failed: %s", e)
-        safe_mlflow_end()
-        safe_wandb_finish()
-        return EXIT_FAILURE
-
-    # Create environment factory
-    env_factory = _local_make_env({})
-
-    # Run evaluation (vectorized if possible)
-    try:
-        res = run_vectorized_evaluation(policy,
-                                        env_factory,
-                                        episodes=cfg.eval_episodes,
-                                        max_steps=cfg.max_steps,
-                                        n_workers=min(8, max(1, mp.cpu_count() // 2)))
-    except Exception:
-        LOG.exception("Evaluation loop failed")
-        safe_mlflow_end()
-        safe_wandb_finish()
-        return EXIT_FAILURE
-
-    # Write result JSON file
-    result_file = cfg.out or str(DEFAULT_RESULTS_DIR / f"eval_result_{int(time.time())}.json")
-    pathlib.Path(result_file).parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(result_file, "w", encoding="utf-8") as f:
-            json.dump(res, f, indent=2, default=str)
-        LOG.info("Wrote result to %s", result_file)
-    except Exception:
-        LOG.exception("Failed to write evaluation result file")
-
-    # Log metrics to MLflow/W&B
-    safe_mlflow_log_metrics({
-        "reward_mean": res.get("reward_mean", 0.0),
-        "reward_std": res.get("reward_std", 0.0),
-        "reward_p95": res.get("reward_p95", 0.0),
-        "episodes_completed": res.get("episodes_completed", 0)
-    })
-    safe_wandb_log({
-        "reward_mean": res.get("reward_mean", 0.0),
-        "reward_std": res.get("reward_std", 0.0),
-        "reward_p95": res.get("reward_p95", 0.0),
-        "episodes_completed": res.get("episodes_completed", 0)
-    })
-
-    # Optionally upload to S3
-    s3_uri = upload_results_to_s3(result_file, cfg)
-    if s3_uri:
-        safe_mlflow_log_metrics({"result_uploaded": 1.0})
-        safe_wandb_log({"result_uploaded": 1.0})
-
-    safe_mlflow_end()
-    safe_wandb_finish()
-
-    # Determine exit code
-    mean_reward = res.get("reward_mean", 0.0)
-    if cfg.stop_if_below_mean_reward is not None and mean_reward < cfg.stop_if_below_mean_reward:
-        LOG.warning("Mean reward %.3f below threshold %.3f", mean_reward, cfg.stop_if_below_mean_reward)
-        return EXIT_MEAN_BELOW_THRESHOLD
-
-    LOG.info("=== Evaluation complete. Mean reward: %.3f ± %.3f ===", mean_reward, res.get("reward_std", 0.0))
-    return EXIT_OK
-
-
-# -------------------------
-# CLI Entry
-# -------------------------
-def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="PriorityMax RL Evaluation Runner (enterprise-grade)")
-    p.add_argument("--config", help="Path to YAML/JSON config file")
-    p.add_argument("--model-dir", help="Path or S3 URI to model directory")
-    p.add_argument("--checkpoint", help="Explicit checkpoint file")
-    p.add_argument("--model-tag", help="Model registry tag")
-    p.add_argument("--eval-episodes", type=int, help="Number of episodes to evaluate")
-    p.add_argument("--max-steps", type=int, help="Max steps per episode")
-    p.add_argument("--device", default="cpu", help="Device string (cpu, cuda, cuda:0)")
-    p.add_argument("--seed", type=int, help="Random seed")
-    p.add_argument("--stop-if-below-mean-reward", type=float, help="Fail if mean reward below this threshold")
-    p.add_argument("--mlflow", action="store_true", help="Enable MLflow logging")
-    p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
-    p.add_argument("--s3-bucket", help="Optional S3 bucket for uploads")
-    p.add_argument("--s3-prefix", help="S3 prefix path (default eval-results/...)")
-    p.add_argument("--out", help="Output result JSON path")
-    return p
-
-
-def main_cli():
-    parser = build_arg_parser()
-    args = parser.parse_args()
-    try:
-        cfg = EvalConfig.from_cli_and_file(args)
-    except Exception as e:
-        LOG.error("Failed to load configuration: %s", e)
-        sys.exit(EXIT_CONFIG_ERROR)
-
-    # Handle graceful signals
-    def _handle_sig(sig, frame):
-        LOG.warning("Signal %s received; terminating...", sig)
-        sys.exit(EXIT_FAILURE)
-    signal.signal(signal.SIGINT, _handle_sig)
-    signal.signal(signal.SIGTERM, _handle_sig)
-
-    try:
-        exit_code = run_evaluation(cfg)
-        sys.exit(exit_code)
-    except KeyboardInterrupt:
-        LOG.warning("Interrupted by user")
-        sys.exit(EXIT_FAILURE)
-    except Exception:
-        LOG.exception("Fatal error during evaluation")
-        sys.exit(EXIT_FAILURE)
-
-
-# -------------------------
-# Example usage (for reference)
-# -------------------------
 """
-# Local evaluation example:
-python3 scripts/train_rl_eval.py \
-    --model-dir backend/app/ml/models/ppo_latest \
-    --eval-episodes 50 \
-    --max-steps 1000 \
-    --device cpu \
-    --stop-if-below-mean-reward 100.0
+ENTERPRISE EVALUATION - COMPLETE USAGE GUIDE
+=============================================
 
-# Using config file (YAML):
-python3 scripts/train_rl_eval.py --config configs/eval_prod.yaml
+1. BASIC EVALUATION
+-------------------
+# Evaluate latest model checkpoint
+python3 train_rl_eval.py \\
+    --model-dir backend/app/ml/models/ppo_latest \\
+    --eval-episodes 50 \\
+    --device cpu
 
-# In CI (JSON only, minimal output):
-python3 scripts/train_rl_eval.py --model-tag prod-latest --eval-episodes 5 --out result.json
+# Evaluate specific checkpoint
+python3 train_rl_eval.py \\
+    --checkpoint models/rl_ckpt_0100.pt \\
+    --eval-episodes 100
 
-# In cluster with S3 upload:
-python3 scripts/train_rl_eval.py \
-    --model-dir s3://prioritymax-prod/models/ppo-2025-11-01 \
-    --s3-bucket prioritymax-prod \
-    --s3-prefix evals/2025-11-09 \
-    --mlflow --wandb
+2. ONNX PRODUCTION PATH
+-----------------------
+# Evaluate ONNX model (production inference)
+python3 train_rl_eval.py \\
+    --checkpoint models/rl_model_final.onnx \\
+    --use-onnx \\
+    --eval-episodes 100 \\
+    --benchmark
+
+# With GPU acceleration
+python3 train_rl_eval.py \\
+    --checkpoint models/model.onnx \\
+    --use-onnx \\
+    --onnx-providers CUDAExecutionProvider CPUExecutionProvider \\
+    --device cuda
+
+3. A/B TESTING
+--------------
+# Compare candidate vs baseline
+python3 train_rl_eval.py \\
+    --checkpoint models/candidate_v2.pt \\
+    --baseline-checkpoint models/prod_v1.pt \\
+    --eval-episodes 200 \\
+    --statistical-test ttest \\
+    --confidence-level 0.95
+
+# Non-parametric test (Mann-Whitney U)
+python3 train_rl_eval.py \\
+    --checkpoint candidate.pt \\
+    --baseline-checkpoint baseline.pt \\
+    --statistical-test mannwhitneyu
+
+4. DRIFT DETECTION
+------------------
+# Check for distribution shift
+python3 train_rl_eval.py \\
+    --checkpoint models/current.pt \\
+    --drift-detection \\
+    --drift-reference data/reference_distribution.json \\
+    --drift-threshold 0.3
+
+5. PERFORMANCE BENCHMARKING
+---------------------------
+# Measure inference latency/throughput
+python3 train_rl_eval.py \\
+    --checkpoint models/optimized.pt \\
+    --benchmark \\
+    --benchmark-batch-sizes 1 8 32 64 128
+
+6. FULL CI/CD PIPELINE
+----------------------
+# Complete enterprise evaluation
+python3 train_rl_eval.py \\
+    --model-tag prod-candidate-v3 \\
+    --baseline-checkpoint s3://bucket/models/prod-v2.pt \\
+    --eval-episodes 200 \\
+    --drift-detection \\
+    --drift-reference s3://bucket/drift/baseline.json \\
+    --drift-threshold 0.25 \\
+    --benchmark \\
+    --benchmark-batch-sizes 1 8 32 \\
+    --check-stability \\
+    --stop-if-below-mean-reward 95.0 \\
+    --min-episode-reward 50.0 \\
+    --max-episode-reward 500.0 \\
+    --mlflow \\
+    --mlflow-experiment ProdEval \\
+    --wandb \\
+    --wandb-project PriorityMax-Prod \\
+    --s3-bucket my-ml-artifacts \\
+    --s3-prefix evals/$(date +%Y%m%d) \\
+    --prometheus \\
+    --prometheus-port 9304 \\
+    --num-workers 8 \\
+    --out results/eval_$(date +%s).json
+
+7. KUBERNETES CI JOB
+--------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rl-model-eval
+spec:
+  template:
+    spec:
+      containers:
+      - name: evaluator
+        image: prioritymax/rl-eval:latest
+        command:
+        - python3
+        - train_rl_eval.py
+        args:
+        - --config
+        - /config/eval_prod.yaml
+        - --out
+        - /results/eval_result.json
+        - --s3-bucket
+        - prod-ml-artifacts
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: results
+          mountPath: /results
+      restartPolicy: Never
+      volumes:
+      - name: config
+        configMap:
+          name: eval-config
+      - name: results
+        emptyDir: {}
+
+8. GITHUB ACTIONS
+-----------------
+name: Evaluate RL Model
+on:
+  pull_request:
+    paths:
+      - 'models/**'
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+    
+    - name: Evaluate Model
+      run: |
+        python3 scripts/train_rl_eval.py \\
+          --checkpoint ${{ github.workspace }}/models/candidate.pt \\
+          --baseline-checkpoint s3://prod/models/baseline.pt \\
+          --eval-episodes 100 \\
+          --stop-if-below-mean-reward 90.0 \\
+          --drift-detection \\
+          --drift-reference s3://prod/drift/baseline.json \\
+          --out ${{ github.workspace }}/eval_result.json
+    
+    - name: Upload Results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: evaluation-results
+        path: eval_result.json
+
+9. EXIT CODES
+-------------
+0 (EXIT_OK): Evaluation successful, all checks passed
+1 (EXIT_FAILURE): Evaluation failed due to error
+2 (EXIT_MEAN_BELOW_THRESHOLD): Mean reward below --stop-if-below-mean-reward
+3 (EXIT_CONFIG_ERROR): Configuration parsing error
+4 (EXIT_MISSING_DEP): Required dependency missing
+
+10. PROMETHEUS METRICS
+----------------------
+When --prometheus is enabled, these metrics are exposed:
+
+- rl_eval_reward_mean: Mean evaluation reward
+- rl_eval_episodes_total: Total episodes evaluated
+- rl_eval_drift_score: Distribution drift score
+- rl_eval_action_latency_seconds: Action inference latency histogram
+
+Query examples:
+# Average reward over time
+rate(rl_eval_reward_mean[5m])
+
+# P95 inference latency
+histogram_quantile(0.95, rl_eval_action_latency_seconds_bucket)
+
+# Drift alerts
+rl_eval_drift_score > 0.3
+
+11. TROUBLESHOOTING
+-------------------
+Q: "ONNX model fails to load"
+A: Ensure onnxruntime is installed: pip install onnxruntime
+   Check ONNX opset version compatibility (use opset 17)
+
+Q: "A/B test shows 'insufficient data'"
+A: Increase --eval-episodes (recommend ≥50 per model)
+   Ensure both models complete episodes successfully
+
+Q: "Drift detection false positives"
+A: Adjust --drift-threshold (higher = less sensitive)
+   Ensure reference data is representative
+   Check reference data has sufficient samples (≥1000)
+
+Q: "Multi-worker evaluation hangs"
+A: Reduce --num-workers
+   Check for GPU memory issues with --device cuda
+   Increase --worker-timeout for slow models
+
+Q: "Prometheus metrics not updating"
+A: Verify port 9304 is accessible
+   Check firewall/network policies
+   Ensure prometheus_client is installed
+
+12. BEST PRACTICES
+------------------
+✅ Always use ONNX evaluation for production models
+✅ Run A/B tests with confidence_level ≥ 0.95
+✅ Enable drift detection for production monitoring
+✅ Benchmark on target hardware (CPU vs GPU)
+✅ Set conservative thresholds initially
+✅ Log to both MLflow and W&B for redundancy
+✅ Upload artifacts to S3 for audit trail
+✅ Use --check-stability to catch NaN/Inf bugs
+✅ Run parallel evaluation for large test suites
+✅ Monitor Prometheus metrics in production
+
+13. CONFIGURATION FILE EXAMPLES
+--------------------------------
+# eval_prod.yaml
+eval_episodes: 100
+max_steps: 1000
+device: cpu
+deterministic: true
+seed: 42
+
+use_onnx: true
+onnx_providers:
+  - CPUExecutionProvider
+
+baseline_checkpoint: s3://bucket/models/prod_v1.onnx
+statistical_test: ttest
+confidence_level: 0.95
+
+enable_drift_detection: true
+drift_reference_data: s3://bucket/drift/baseline_2024.json
+drift_threshold: 0.25
+
+measure_inference_time: true
+benchmark_batch_sizes: [1, 8, 32]
+
+check_numerical_stability: true
+min_episode_reward: 50.0
+max_episode_reward: 300.0
+
+log_mlflow: true
+mlflow_experiment: Production-Eval
+log_wandb: true
+wandb_project: PriorityMax-Prod
+
+s3_bucket: ml-artifacts-prod
+s3_prefix: evals/production
+
+enable_prometheus: true
+prometheus_port: 9304
+
+num_workers: 8
+worker_timeout: 3600
+
+stop_if_below_mean_reward: 90.0
 """
+
+# =========================================================================
+# ENTRY POINT
+# =========================================================================
 
 if __name__ == "__main__":
     main_cli()

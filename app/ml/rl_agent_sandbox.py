@@ -18,22 +18,21 @@ Features:
   - Prometheus metrics export (optional).
   - Trace recording (save to JSON), replay mode, diff mode (compare two models).
   - Heuristic fallback and safety wrapper (guaranteed sandbox).
+
+SYNCHRONIZED WITH:
+ - real_env.py (SimulatedRealEnv, EnvConfig)
+ - rl_agent_prod.py (PPOActorCritic arch, obs_dim=8, act_dim=3)
+ - train_rl_heavy.py / train_rl_eval.py / train_rl_live.py (shared config + reward params)
+
+Consistency Notes:
+ ✅ Observation vector (8D): [queue_length, worker_count, avg_latency_ms, p95_latency_ms, success_rate, arrival_rate, cpu, mem]
+ ✅ Action vector (3D): [delta_workers, throttle, priority_bias]
+ ✅ Config fields: max_scale_delta, reward_latency_sla_ms, cost_per_worker_per_sec, drift_window_size
+ ✅ Fully sandbox-safe (no external live system calls)
 """
 
 from __future__ import annotations
-
-import os
-import sys
-import time
-import json
-import math
-import logging
-import pathlib
-import threading
-import queue
-import signal
-import argparse
-import tempfile
+import os, sys, time, json, math, logging, pathlib, threading, queue, signal, argparse, tempfile
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, List, Callable, Tuple
 
@@ -41,44 +40,35 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# Add project app to path for local imports
+# --- Ensure local imports match production-level real_env structure ---
 ROOT = pathlib.Path(__file__).resolve().parents[2] / "app"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Import SimulatedRealEnv from your real_env module
 try:
+    # ✅ Updated: import consistent with new EnvConfig + SimulatedRealEnv + helpers
     from ml.real_env import SimulatedRealEnv, EnvConfig, make_env, make_vec_env
 except Exception:
-    # Provide a minimal fallback to avoid import errors in some environments
-    raise
+    raise ImportError("Failed to import SimulatedRealEnv or EnvConfig; check backend/app/ml/real_env.py")
 
-# Optional observability libraries
+# Optional observability integrations
 try:
-    import wandb
-    _HAS_WANDB = True
+    import wandb; _HAS_WANDB = True
 except Exception:
     _HAS_WANDB = False
-
 try:
-    import mlflow
-    _HAS_MLFLOW = True
+    import mlflow; _HAS_MLFLOW = True
 except Exception:
     _HAS_MLFLOW = False
-
 try:
-    from prometheus_client import start_http_server, Gauge, Histogram, Counter
-    _HAS_PROM = True
+    from prometheus_client import start_http_server, Gauge, Histogram, Counter; _HAS_PROM = True
 except Exception:
     _HAS_PROM = False
-
-# Optional lightweight web UI
 try:
     from fastapi import FastAPI, APIRouter
     from fastapi.responses import JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
-    import uvicorn
-    _HAS_FASTAPI = True
+    import uvicorn; _HAS_FASTAPI = True
 except Exception:
     _HAS_FASTAPI = False
 
@@ -91,7 +81,7 @@ if not LOG.handlers:
     LOG.addHandler(ch)
 
 # Paths
-BASE_DIR = pathlib.Path(__file__).resolve().parents[2]  # backend/
+BASE_DIR = pathlib.Path(__file__).resolve().parents[2]
 MODELS_DIR = BASE_DIR / "app" / "ml" / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_MODEL = MODELS_DIR / "rl_agent.pt"
@@ -107,22 +97,22 @@ class SandboxConfig:
     env_seed: int = 1234
     steps_per_episode: int = 500
     episodes: int = 20
-    loop_interval: float = 1.0  # seconds between agent ticks
+    loop_interval: float = 1.0
     hot_reload: bool = False
     save_traces_dir: Optional[str] = None
     log_to_wandb: bool = False
     log_to_mlflow: bool = False
     prom_port: int = 9300
     api_port: int = 8008
-    device: str = "cpu"  # or "cuda"
+    device: str = "cpu"
     deterministic: bool = True
     debug: bool = False
 
 # -----------------------
-# ActorCritic (same as training/inference)
+# PPOActorCritic (SYNCHRONIZED)
 # -----------------------
 class PPOActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden_dim: int = 128):
+    def __init__(self, obs_dim: int = 8, act_dim: int = 3, hidden_dim: int = 128):
         super().__init__()
         self.actor = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
@@ -151,10 +141,11 @@ class PPOActorCritic(nn.Module):
         return self.critic(obs)
 
 # -----------------------
-# SandboxAgent: runs a single agent loop against one SimulatedRealEnv
+# SandboxAgent (unchanged logic)
 # -----------------------
 class SandboxAgent(threading.Thread):
-    def __init__(self, agent_id: int, cfg: SandboxConfig, env_cfg: EnvConfig, model_loader: Callable[[], nn.Module], trace_queue: queue.Queue):
+    def __init__(self, agent_id: int, cfg: SandboxConfig, env_cfg: EnvConfig,
+                 model_loader: Callable[[], nn.Module], trace_queue: queue.Queue):
         super().__init__(daemon=True)
         self.agent_id = agent_id
         self.cfg = cfg
@@ -170,24 +161,22 @@ class SandboxAgent(threading.Thread):
         self.metrics = {"actions": 0, "errors": 0, "rewards": []}
 
     def _load_model_safe(self):
-        """Load model if exists; keep None allowed (random policy fallback)."""
         path = pathlib.Path(self.cfg.model_path)
         if path.exists():
             try:
                 ckpt = torch.load(str(path), map_location=self.device)
-                # assume obs_dim=8, act_dim=3 as before
+                # ✅ enforce synced obs/act dimensions (8, 3)
                 model = PPOActorCritic(8, 3)
                 model.load_state_dict(ckpt.get("model", ckpt))
-                model.to(self.device)
-                model.eval()
+                model.to(self.device).eval()
                 self.model = model
                 self.model_ts = path.stat().st_mtime
                 LOG.info(f"[Agent {self.agent_id}] Model loaded from {path}")
             except Exception:
-                LOG.exception(f"[Agent {self.agent_id}] Failed to load model; using fallback")
+                LOG.exception(f"[Agent {self.agent_id}] Failed to load model; fallback active")
                 self.model = None
         else:
-            LOG.info(f"[Agent {self.agent_id}] No model found at {path}; using fallback policy")
+            LOG.warning(f"[Agent {self.agent_id}] Model not found at {path}; using fallback")
             self.model = None
 
     def check_hot_reload(self):
@@ -197,15 +186,13 @@ class SandboxAgent(threading.Thread):
         if path.exists():
             mtime = path.stat().st_mtime
             if self.model_ts is None or mtime > (self.model_ts + 1e-6):
-                LOG.info(f"[Agent {self.agent_id}] Hot-reloading model (mtime {mtime})")
+                LOG.info(f"[Agent {self.agent_id}] Hot-reloading model...")
                 self._load_model_safe()
 
     def heuristic_policy(self, obs: np.ndarray) -> np.ndarray:
-        """Simple safe sandbox heuristic - deterministic-ish"""
+        # ✅ remains deterministic and sandbox-safe
         queue_len, consumers, avg_lat, p95, success, arrival, cpu, mem = obs
-        delta = 0
-        throttle = 0.0
-        priority = 0
+        delta, throttle, priority = 0, 0.0, 0
         if avg_lat > 500 and queue_len > consumers * 2:
             delta = min(5, int(math.ceil(queue_len / max(1, consumers)) - 1))
         elif queue_len < max(2, consumers // 2):
@@ -219,10 +206,10 @@ class SandboxAgent(threading.Thread):
         try:
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
             with torch.no_grad():
-                action, logp = self.model.act(obs_t)
-            return action.cpu().numpy().astype(np.float32)
+                act, _, _ = self.model.act(obs_t)
+            return act.cpu().numpy().astype(np.float32)
         except Exception:
-            LOG.exception(f"[Agent {self.agent_id}] Model inference failed; falling back")
+            LOG.exception(f"[Agent {self.agent_id}] Inference failed; fallback active")
             self.metrics["errors"] += 1
             return self.heuristic_policy(obs)
 

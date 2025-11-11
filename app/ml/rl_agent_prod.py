@@ -95,9 +95,10 @@ class RLAgentConfig:
     loop_interval: float = float(os.getenv("RL_AGENT_LOOP_INTERVAL", "5.0"))  # seconds
     cooldown: float = float(os.getenv("RL_AGENT_ACTION_COOLDOWN", "10.0"))
     dry_run: bool = os.getenv("RL_AGENT_DRY_RUN", "true").lower() == "true"
-    min_consumers: int = int(os.getenv("RL_AGENT_MIN_CONSUMERS", "1"))
-    max_consumers: int = int(os.getenv("RL_AGENT_MAX_CONSUMERS", "200"))
-    max_delta: int = int(os.getenv("RL_AGENT_MAX_DELTA", "10"))
+    # keep original names but support EnvConfig naming too (min_workers / max_workers)
+    min_consumers: int = int(os.getenv("RL_AGENT_MIN_CONSUMERS", os.getenv("RL_AGENT_MIN_WORKERS", "1")))
+    max_consumers: int = int(os.getenv("RL_AGENT_MAX_CONSUMERS", os.getenv("RL_AGENT_MAX_WORKERS", "200")))
+    max_delta: int = int(os.getenv("RL_AGENT_MAX_DELTA", os.getenv("PRIORITYMAX_MAX_SCALE_DELTA", "10")))
     throttle_limit: float = float(os.getenv("RL_AGENT_MAX_THROTTLE", "1.0"))
     reward_latency_sla_ms: float = float(os.getenv("RL_AGENT_SLA_MS", "500"))
     use_gpu: bool = torch.cuda.is_available()
@@ -105,6 +106,16 @@ class RLAgentConfig:
     safe_mode: bool = True
     seed: int = int(os.getenv("RL_AGENT_SEED", "42"))
     prom_port: int = int(os.getenv("RL_AGENT_PROM_PORT", "9205"))
+
+    # Backwards-compatible mapping: populate min_workers/max_workers names if caller expects them
+    def __post_init__(self):
+        # Provide both naming styles used across repo
+        if not hasattr(self, "min_workers"):
+            setattr(self, "min_workers", getattr(self, "min_consumers"))
+        if not hasattr(self, "max_workers"):
+            setattr(self, "max_workers", getattr(self, "max_consumers"))
+        if not hasattr(self, "max_scale_delta"):
+            setattr(self, "max_scale_delta", getattr(self, "max_delta"))
 
 # -----------------------------
 # PPO Model (same arch as training)
@@ -172,7 +183,26 @@ class RLAgentProd:
         ckpt = torch.load(self.cfg.model_path, map_location=self.device)
         # Determine obs/act dims dynamically (8 obs, 3 acts)
         self.model = PPOActorCritic(8, 3).to(self.device)
-        self.model.load_state_dict(ckpt["model"])
+        # allow both 'model' or 'state_dict' keys in checkpoint (back-compat safety)
+        if "model" in ckpt:
+            state = ckpt["model"]
+        elif "state_dict" in ckpt:
+            state = ckpt["state_dict"]
+        else:
+            state = ckpt
+        # If the checkpoint stores the raw state_dict under nested structure keep behavior the same
+        if isinstance(state, dict):
+            try:
+                self.model.load_state_dict(state)
+            except Exception:
+                # if ckpt provided wrapper { "model": {"actor...":...}, ... } try direct key access
+                if "model" in ckpt and isinstance(ckpt["model"], dict):
+                    self.model.load_state_dict(ckpt["model"])
+                else:
+                    raise
+        else:
+            # fallback (preserve original behavior if structure differs)
+            self.model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
         self.model.eval()
         LOG.info(f"Loaded RL model from {self.cfg.model_path}")
 
@@ -212,16 +242,23 @@ class RLAgentProd:
             if self._redis:
                 m = await self._redis.hgetall("prioritymax:live_metrics")
                 if m:
-                    vals = {k: float(v) for k, v in m.items()}
+                    # support both 'consumer_count' and 'worker_count' naming
+                    vals = {}
+                    for k, v in m.items():
+                        try:
+                            vals[k] = float(v)
+                        except Exception:
+                            # keep original string if not castable
+                            vals[k] = v
                     obs = np.array([
-                        vals.get("queue_length", 0.0),
-                        vals.get("consumer_count", 0.0),
-                        vals.get("avg_latency_ms", 0.0),
-                        vals.get("p95_latency_ms", 0.0),
+                        vals.get("queue_length", vals.get("queue", 0.0)),
+                        vals.get("consumer_count", vals.get("worker_count", 0.0)),
+                        vals.get("avg_latency_ms", vals.get("avg_lat_ms", 0.0)),
+                        vals.get("p95_latency_ms", vals.get("p95_lat_ms", 0.0)),
                         vals.get("success_rate", 1.0),
-                        vals.get("arrival_rate", 0.0),
+                        vals.get("arrival_rate", vals.get("arrival", 0.0)),
                         vals.get("cpu", 0.0),
-                        vals.get("mem", 0.0),
+                        vals.get("mem", vals.get("memory_utilization", vals.get("mem", 0.0))),
                     ], dtype=np.float32)
             elif self._mongo:
                 db = self._mongo.get_default_database()
@@ -229,17 +266,17 @@ class RLAgentProd:
                 doc = await coll.find_one(sort=[("_id", -1)])
                 if doc:
                     obs = np.array([
-                        float(doc.get("queue_length", 0)),
-                        float(doc.get("consumer_count", 0)),
-                        float(doc.get("avg_latency_ms", 0)),
-                        float(doc.get("p95_latency_ms", 0)),
+                        float(doc.get("queue_length", doc.get("queue", 0))),
+                        float(doc.get("consumer_count", doc.get("worker_count", 0))),
+                        float(doc.get("avg_latency_ms", doc.get("avg_lat_ms", 0))),
+                        float(doc.get("p95_latency_ms", doc.get("p95_lat_ms", 0))),
                         float(doc.get("success_rate", 1)),
-                        float(doc.get("arrival_rate", 0)),
+                        float(doc.get("arrival_rate", doc.get("arrival", 0))),
                         float(doc.get("cpu", 0)),
-                        float(doc.get("mem", 0)),
+                        float(doc.get("mem", doc.get("memory_utilization", doc.get("mem", 0)))),
                     ], dtype=np.float32)
             elif self.predictor:
-                # fallback: synthetic metrics
+                # fallback: synthetic metrics or predictor-managed metrics
                 obs = np.random.rand(8).astype(np.float32)
         except Exception:
             LOG.exception("Observation fetch failed")
@@ -306,10 +343,14 @@ class RLAgentProd:
         act["obs"] = obs.tolist()
         act["model_version"] = None
         if self.model_registry:
-            latest = self.model_registry.get_latest("rl_agent.pt")
-            act["model_version"] = latest["version_id"] if latest else None
+            try:
+                latest = self.model_registry.get_latest("rl_agent.pt")
+                act["model_version"] = latest["version_id"] if latest else None
+            except Exception:
+                LOG.debug("ModelRegistry lookup failed; continuing without model_version")
 
         try:
+            # Prefer storing in redis stream/list used by external operator
             if self._redis:
                 await self._redis.lpush("prioritymax:rl_actions", json.dumps(act))
             elif self._mongo:
@@ -375,7 +416,16 @@ def _build_cli():
 
 def main_cli():
     args = _build_cli().parse_args()
-    cfg = RLAgentConfig(dry_run=args.dry, loop_interval=args.interval, cooldown=args.cooldown, use_gpu=args.gpu, seed=args.seed)
+    # create config while keeping original names, but mapped in RLAgentConfig.__post_init__
+    cfg = RLAgentConfig(
+        redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        mongo_url=os.getenv("MONGO_URL", None),
+        model_path=str(MODEL_PATH),
+        loop_interval=args.interval,
+        cooldown=args.cooldown,
+        dry_run=args.dry,
+        seed=args.seed
+    )
     agent = RLAgentProd(cfg)
 
     async def runner():
@@ -385,7 +435,11 @@ def main_cli():
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(agent.stop()))
+        try:
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(agent.stop()))
+        except NotImplementedError:
+            # Not all platforms support loop.add_signal_handler (Windows)
+            pass
     try:
         loop.run_until_complete(runner())
     except KeyboardInterrupt:
