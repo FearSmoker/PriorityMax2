@@ -935,21 +935,42 @@ class RealEnvBase:
     def _terminal_condition(self) -> bool:
         """
         Check if episode should terminate.
-        TUNED: More lenient termination to allow learning.
-        """
-        # Only terminate on EXTREME overload (not during normal training)
-        catastrophic_latency = self.state["p95_latency_ms"] > 100000  # 100 seconds
-        catastrophic_queue = self.state["queue_length"] >= self.cfg.sim_max_queue * 0.99
         
-        if catastrophic_latency or catastrophic_queue:
+        FIXED: Much more lenient criteria for stable RL training.
+        - Increased thresholds significantly
+        - Added step limit to prevent infinite episodes  
+        - Only terminates on truly catastrophic failures
+        - Allows agent to learn from difficult situations
+        """
+        # Prevent infinite episodes with step limit
+        MAX_EPISODE_STEPS = 10000
+        if self.step_count >= MAX_EPISODE_STEPS:
+            LOG.info("Episode complete: reached max steps (%d)", MAX_EPISODE_STEPS)
+            return True
+        
+        # Define EXTREME failure thresholds (much more lenient than before)
+        catastrophic_latency = self.state["p95_latency_ms"] > 500000  # 500 seconds (was 100s)
+        catastrophic_queue = self.state["queue_length"] >= self.cfg.sim_max_queue * 0.999  # 99.9% full (was 99%)
+        complete_system_failure = self.state["success_rate"] < 0.01  # Less than 1% success rate
+        
+        # Only terminate if multiple failure conditions are met
+        should_terminate = (catastrophic_latency and catastrophic_queue) or complete_system_failure
+        
+        if should_terminate:
             if self.circuit_breaker:
                 self.circuit_breaker.record_failure()
-            LOG.warning("Episode terminated: lat=%.0fms queue=%.0f", 
-                       self.state["p95_latency_ms"], self.state["queue_length"])
+            
+            LOG.warning(
+                "Episode terminated: lat=%.0fms queue=%.0f/%.0f success=%.2f%% step=%d",
+                self.state["p95_latency_ms"], 
+                self.state["queue_length"],
+                self.cfg.sim_max_queue,
+                self.state["success_rate"] * 100,
+                self.step_count
+            )
             return True
         
         return False
-
 # ---------------------------------------------------
 # SIMULATED ENVIRONMENT (for training) - FIXED
 # ---------------------------------------------------
