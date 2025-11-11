@@ -436,7 +436,7 @@ class RealEnvBase:
         # Enterprise components
         self.circuit_breaker = CircuitBreaker(
             threshold=config.circuit_breaker_threshold,
-            window_seconds=config.circuit_breaker_window_seconds
+            window_sec=config.circuit_breaker_window_seconds
         ) if config.enable_circuit_breaker else None
 
         self.drift_tracker = DriftTracker(
