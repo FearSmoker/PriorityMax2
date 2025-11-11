@@ -515,12 +515,12 @@ class RealEnvBase:
 
             # Audit log
             if self.cfg.enable_audit_logging:
-                write_audit_event({
+                asyncio.create_task(write_audit_event({
                     "event": "env_reset",
                     "episode": self.episode_count,
                     "seed": seed,
                     "timestamp": datetime.utcnow().isoformat() + "Z"
-                })
+                }))
 
             return obs
 
@@ -636,12 +636,12 @@ class RealEnvBase:
                 pass
 
         if self.cfg.enable_audit_logging:
-            write_audit_event({
+            asyncio.create_task(write_audit_event({
                 "event": "env_closed",
                 "total_steps": self.step_count,
                 "total_episodes": self.episode_count,
                 "timestamp": datetime.utcnow().isoformat() + "Z"
-            })
+            }))
 
         LOG.info("Environment closed (steps=%d, episodes=%d)",
                  self.step_count, self.episode_count)
@@ -758,11 +758,11 @@ class RealEnvBase:
                     p = pathlib.Path(tempfile.gettempdir()) / f"intent_{intent['id']}.json"
                     p.write_text(json.dumps(intent))
                 attempt["message"] = "intent_emitted"
-                write_audit_event({
+                asyncio.create_task(write_audit_event({
                     "event": "live_scale_intent",
                     "intent": intent,
                     "timestamp": datetime.utcnow().isoformat() + "Z",
-                })
+                }))
             except Exception as e:
                 LOG.exception("Failed to emit scale intent: %s", e)
                 attempt["message"] = f"intent_emit_failed: {e}"
