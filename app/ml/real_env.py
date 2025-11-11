@@ -234,54 +234,45 @@ class EnvConfig:
 
 
 class CircuitBreaker:
-    """Circuit breaker synchronized with train_rl_live.py."""
-    def __init__(self, threshold=5, window_seconds=300):
+    def __init__(self, threshold=5, window_sec=300, cooldown_sec=60):
+        """
+        threshold: number of failures allowed in the window
+        window_sec: time window for counting failures
+        cooldown_sec: minimum interval between repeated open logs
+        """
         self.threshold = threshold
-        self.window_seconds = window_seconds
-        self.failures = deque()
-        self.state = "CLOSED"
-        self.last_state_change = time.time()
-        self.lock = threading.Lock()
-        LOG.info("🔌 Circuit breaker initialized (threshold=%d, window=%ds)", threshold, window_seconds)
+        self.window_sec = window_sec
+        self.cooldown_sec = cooldown_sec
+        self.failures = deque(maxlen=threshold)
+        self.open = False
+        self.last_open_log = 0.0
+        self.last_block_log = 0.0
 
     def record_failure(self):
-        with self.lock:
-            now = time.time()
-            self.failures.append(now)
-            cutoff = now - self.window_seconds
-            while self.failures and self.failures[0] < cutoff:
-                self.failures.popleft()
-            if len(self.failures) >= self.threshold and self.state == "CLOSED":
-                self.state = "OPEN"
-                self.last_state_change = now
+        now = time.time()
+        self.failures.append(now)
+        if len(self.failures) >= self.threshold and now - self.failures[0] <= self.window_sec:
+            self.open = True
+            if now - self.last_open_log > self.cooldown_sec:
                 LOG.error("⚠️ CIRCUIT BREAKER OPENED - Too many failures (%d in %ds)",
-                          len(self.failures), self.window_seconds)
-                write_audit_event({
-                    "event": "circuit_breaker_opened",
-                    "failures": len(self.failures),
-                    "timestamp": datetime.utcnow().isoformat() + "Z"
-                })
+                          self.threshold, self.window_sec)
+                self.last_open_log = now
 
-    def record_success(self):
-        with self.lock:
-            if self.state == "HALF_OPEN":
-                self.state = "CLOSED"
-                self.failures.clear()
-                LOG.info("✅ Circuit breaker CLOSED - System recovered")
-                write_audit_event({
-                    "event": "circuit_breaker_closed",
-                    "timestamp": datetime.utcnow().isoformat() + "Z"
-                })
-
-    def can_execute(self) -> bool:
-        with self.lock:
+    def allow(self) -> bool:
+        """Return False if breaker open; log at most once every cooldown_sec."""
+        if self.open:
             now = time.time()
-            if self.state == "OPEN" and (now - self.last_state_change) > self.window_seconds:
-                self.state = "HALF_OPEN"
-                self.last_state_change = now
-                LOG.info("🔄 Circuit breaker HALF_OPEN - Testing recovery")
-            return self.state != "OPEN"
+            if now - self.last_block_log > self.cooldown_sec:
+                LOG.warning("⚠️ Circuit breaker OPEN - action blocked")
+                self.last_block_log = now
+            return False
+        return True
 
+    def reset(self):
+        """Manually reset breaker state (for recovery logic)."""
+        self.open = False
+        self.failures.clear()
+        LOG.info("✅ Circuit breaker reset")
 
 class DriftTracker:
     """Tracks observation and reward distributions for drift detection."""
