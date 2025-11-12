@@ -1,31 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PriorityMax - Real Environment Bridge for RL Training - ENTERPRISE EDITION (FIXED)
------------------------------------------------------------------------------------
+PriorityMax - FAANG-Level Production RL Environment
+----------------------------------------------------
+A hyper-realistic autoscaling simulation that models:
+✅ Multi-region distributed systems
+✅ Complex workload patterns (diurnal, seasonal, flash crowds)
+✅ Heterogeneous workers with failure modes
+✅ Network latency and partition scenarios
+✅ Cost optimization with spot instances
+✅ SLA violations and cascading failures
+✅ Real-world constraints and operational complexity
 
-SYNCHRONIZED WITH:
-- train_rl_heavy.py (observation/action dimensions, PPO training)
-- train_rl_live.py (live mode operations, safety features)
-- train_rl_eval.py (evaluation protocols, drift detection)
-
-✅ FIXED: AsyncIO event loop issues
-✅ FIXED: Thread-safe audit logging
-✅ FIXED: Sync/async compatibility
-✅ All enterprise features preserved
-
-Enterprise Production Features:
-✅ Observation space matches training scripts (dynamic obs_dim detection)
-✅ Action space synchronized (3D continuous: [delta_workers, throttle, priority])
-✅ Safety features: circuit breakers, rate limiting, dry-run mode
-✅ Live telemetry integration (Redis, Mongo, Prometheus)
-✅ Realistic simulation with diurnal patterns, bursts, heterogeneity
-✅ Drift detection support (observation/reward distribution tracking)
-✅ Audit logging for all actions (FIXED - thread-safe)
-✅ Health monitoring and metrics export
-✅ Thread-safe operations for concurrent training
-✅ Emergency shutdown hooks
-✅ Production-ready reward shaping
+ENTERPRISE FEATURES:
+- Advanced reward shaping with multiple objectives
+- Realistic failure injection (Byzantine, crash, network)
+- Workload generators (e-commerce, social media, streaming)
+- Multi-tier architecture simulation
+- Canary deployment modeling
+- Circuit breakers and rate limiting
+- Observability and drift detection
 """
 
 from __future__ import annotations
@@ -39,55 +33,44 @@ import uuid
 import random
 import logging
 import pathlib
-import tempfile
 import threading
 import signal
 import atexit
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Tuple, Optional, Callable, Iterable, Union
+from typing import Any, Dict, List, Tuple, Optional, Callable, Union
 from collections import deque, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
+from enum import Enum
 import statistics
 
 import numpy as np
 
-# Optional dependencies (best-effort imports)
+# Optional dependencies
 try:
     import pandas as pd
     _HAS_PANDAS = True
-except Exception:
+except:
     pd = None
     _HAS_PANDAS = False
 
 try:
     import redis
     _HAS_REDIS = True
-except Exception:
+except:
     redis = None
     _HAS_REDIS = False
-
-try:
-    import psutil
-    _HAS_PSUTIL = True
-except Exception:
-    psutil = None
-    _HAS_PSUTIL = False
 
 try:
     import gymnasium as gym
     from gymnasium import spaces
     _HAS_GYM = True
-    LOG_GYM = True
-except Exception:
+except:
     try:
         import gym
         from gym import spaces
         _HAS_GYM = True
-        LOG_GYM = True
-    except Exception:
+    except:
         _HAS_GYM = False
-        LOG_GYM = False
-        # Minimal fallback
         class spaces:
             class Box:
                 def __init__(self, low, high, shape=None, dtype=np.float32):
@@ -95,17 +78,6 @@ except Exception:
                     self.high = high
                     self.shape = shape if shape is not None else (len(low),)
                     self.dtype = dtype
-            
-            class Discrete:
-                def __init__(self, n):
-                    self.n = n
-
-try:
-    from prometheus_client import CollectorRegistry, Gauge, Histogram, Counter
-    _HAS_PROM = True
-except Exception:
-    CollectorRegistry = Gauge = Histogram = Counter = None
-    _HAS_PROM = False
 
 # Logging
 LOG = logging.getLogger("prioritymax.ml.real_env")
@@ -115,228 +87,476 @@ _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %
 if not LOG.handlers:
     LOG.addHandler(_handler)
 
-if LOG_GYM and _HAS_GYM:
-    try:
-        LOG.info("Using Gymnasium (version %s)", gym.__version__)
-    except:
-        LOG.info("Gymnasium/Gym available")
-
 # Paths
 BASE_DIR = pathlib.Path(__file__).resolve().parents[2]
-DATA_DIR = pathlib.Path(os.getenv("PRIORITYMAX_DATA_DIR", str(BASE_DIR / "datasets")))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 AUDIT_LOG_DIR = BASE_DIR / "logs"
 AUDIT_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------
-# FIXED: Thread-Safe Audit Logger
-# ---------------------------
+# =============================================================================
+# ENUMS AND CONSTANTS
+# =============================================================================
+
+class WorkloadType(Enum):
+    """Real-world workload patterns"""
+    ECOMMERCE = "ecommerce"           # Black Friday spikes
+    SOCIAL_MEDIA = "social_media"     # Viral events
+    STREAMING = "streaming"           # Peak hours
+    API_BACKEND = "api_backend"       # Steady with bursts
+    BATCH_PROCESSING = "batch"        # Scheduled jobs
+    GAMING = "gaming"                 # Tournament spikes
+
+class FailureMode(Enum):
+    """Worker failure scenarios"""
+    CRASH = "crash"                   # Abrupt termination
+    BYZANTINE = "byzantine"           # Produces wrong results
+    SLOW = "slow"                     # Degraded performance
+    NETWORK = "network"               # Connectivity issues
+    OOM = "oom"                       # Out of memory
+
+class WorkerTier(Enum):
+    """Worker types with cost/performance tradeoffs"""
+    SPOT = "spot"                     # Cheap, preemptible
+    ON_DEMAND = "on_demand"           # Standard
+    RESERVED = "reserved"             # Discounted, committed
+
+# =============================================================================
+# THREAD-SAFE AUDIT LOGGER
+# =============================================================================
+
 class AuditLogger:
-    """
-    Thread-safe, synchronous audit logger.
-    NO asyncio dependencies - works in any context.
-    """
     def __init__(self, log_dir: pathlib.Path = AUDIT_LOG_DIR):
         self.log_file = log_dir / "real_env_audit.jsonl"
         self.lock = threading.Lock()
         self.enabled = True
         
     def log(self, event: Dict[str, Any]):
-        """Thread-safe synchronous logging."""
         if not self.enabled:
             return
-        
         try:
             with self.lock:
-                # Add timestamp if not present
                 if "timestamp" not in event:
                     event["timestamp"] = datetime.utcnow().isoformat() + "Z"
-                
-                # Write atomically
                 with open(self.log_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(event, default=str) + "\n")
         except Exception as e:
             LOG.debug("Audit log write failed: %s", e)
 
-# Global audit logger instance
 _AUDIT_LOGGER = AuditLogger()
 
 def write_audit_event(payload: Dict[str, Any]):
-    """
-    FIXED: Synchronous audit logging function.
-    Compatible with both sync and async contexts.
-    """
     _AUDIT_LOGGER.log(payload)
 
-# ---------------------------
-# Environment Configuration
-# ---------------------------
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
 @dataclass
 class EnvConfig:
-    """
-    SYNCHRONIZED with train_rl_heavy.py and train_rl_live.py configurations.
-    """
+    """FAANG-level environment configuration"""
+    
     # Mode
-    mode: str = "sim"  # 'sim' or 'live'
+    mode: str = "sim"
     
-    # Observation/Action dimensions (CRITICAL SYNC POINT)
-    obs_dim: Optional[int] = None  # Auto-detected (typically 8)
-    act_dim: int = 3  # [delta_workers, throttle, priority_bias]
+    # Observation/Action dimensions (SYNCHRONIZED)
+    obs_dim: Optional[int] = 12  # Extended observation space
+    act_dim: int = 3
     
-    # Connectors (live mode)
-    redis_url: Optional[str] = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    mongo_url: Optional[str] = os.getenv("MONGO_URL", None)
-    prometheus_host: Optional[str] = os.getenv("PROM_HOST", None)
+    # === ADVANCED SIMULATION PARAMETERS ===
     
-    # Safety & Rate Limiting (ENTERPRISE FEATURES)
-    max_scale_delta: int = 5  # Max worker change per step
-    min_workers: int = 1
-    max_workers: int = 200
-    action_cooldown_seconds: float = 5.0
-    dry_run: bool = True  # SAFE DEFAULT
+    # Workload characteristics (REALISTIC COMPLEXITY)
+    workload_type: str = "ecommerce"
+    base_arrival_rate: float = 25.0           # Higher base load
+    peak_arrival_multiplier: float = 8.0      # 8x spike during peaks
+    flash_crowd_probability: float = 0.03     # 3% chance per step
+    flash_crowd_duration_steps: int = 30      # Sustained spike
+    flash_crowd_multiplier: float = 15.0      # 15x traffic surge
     
-    # Circuit Breaker (TUNED for training stability)
-    enable_circuit_breaker: bool = False  # Disabled by default for training
-    circuit_breaker_threshold: int = 20  # Higher threshold (was 5)
-    circuit_breaker_window_seconds: int = 60  # Shorter window (was 300)
+    # Diurnal patterns (24-hour cycle)
+    diurnal_amplitude: float = 0.8
+    diurnal_peak_hour: float = 14.0           # 2 PM peak
+    weekly_pattern: bool = True               # Weekend variations
+    seasonal_variation: float = 0.3           # Holiday seasons
     
-    # Observation/Reward Windows
-    obs_window_seconds: int = 60
-    reward_latency_sla_ms: float = 500.0
-    cost_per_worker_per_sec: float = 0.0005
+    # Queue and latency dynamics
+    max_queue_size: int = 50000               # Large queue capacity
+    base_latency_ms: float = 50.0             # Base processing time
+    latency_per_queue_item: float = 0.05      # Congestion effect
+    network_latency_ms: float = 20.0          # Inter-region latency
     
-    # Simulation Parameters (TUNED for stable training)
-    sim_target_throughput: float = 50.0
-    sim_base_latency_ms: float = 100.0
-    sim_noise_scale: float = 0.1  # Reduced noise (was 0.2)
-    sim_failure_rate: float = 0.01  # Lower failure rate (was 0.02)
-    sim_queue_arrival_rate: float = 3.0  # Lower arrival rate (was 5.0)
-    sim_max_queue: int = 10000
-    sim_burst_probability: float = 0.01  # Less frequent bursts (was 0.02)
-    sim_burst_size: float = 10.0  # Smaller bursts (was 20.0)
+    # Worker characteristics (HETEROGENEOUS)
+    min_workers: int = 5
+    max_workers: int = 500                    # Large scale
+    worker_startup_time_steps: int = 3        # Warmup delay
+    worker_shutdown_time_steps: int = 1
+    spot_instance_probability: float = 0.7    # 70% spot instances
+    spot_preemption_rate: float = 0.002       # 0.2% per step
     
-    # Diurnal Pattern
-    sim_diurnal_amplitude: float = 0.7
-    sim_time_step_minutes: float = 1.0
+    # Worker efficiency distribution
+    worker_efficiency_mean: float = 1.0
+    worker_efficiency_std: float = 0.25       # High variance
+    worker_capacity_per_sec: float = 10.0     # Tasks per second
     
-    # Reward Shaping (CRITICAL SYNC POINT)
-    reward_latency_weight: float = 10.0
-    reward_throughput_weight: float = 0.1
-    reward_cost_weight: float = 1.0
-    reward_queue_weight: float = 0.05
-    reward_stability_weight: float = 0.1
-    reward_success_weight: float = 1.0
-    reward_sla_bonus: float = 0.5
+    # Failure injection (REALISTIC)
+    base_failure_rate: float = 0.005          # 0.5% baseline
+    overload_failure_multiplier: float = 3.0  # Failures increase under load
+    cascade_failure_probability: float = 0.01 # 1% chance when SLA violated
+    byzantine_failure_rate: float = 0.001     # Rare but critical
+    network_partition_probability: float = 0.005
     
-    # Drift Detection
+    # Cost model (MULTI-TIER)
+    cost_on_demand_per_sec: float = 0.001
+    cost_spot_per_sec: float = 0.0003         # 70% cheaper
+    cost_reserved_per_sec: float = 0.0007     # 30% cheaper
+    cost_sla_violation: float = 50.0          # Penalty per violation
+    cost_data_transfer_per_gb: float = 0.01
+    
+    # SLA and performance targets
+    sla_latency_p50_ms: float = 200.0
+    sla_latency_p95_ms: float = 500.0
+    sla_latency_p99_ms: float = 1000.0
+    sla_success_rate: float = 0.995           # 99.5% target
+    sla_availability: float = 0.999           # 99.9% uptime
+    
+    # Action constraints
+    max_scale_delta: int = 20                 # Can scale by ±20
+    action_cooldown_seconds: float = 3.0
+    
+    # Reward shaping (MULTI-OBJECTIVE)
+    reward_latency_weight: float = 5.0
+    reward_cost_weight: float = 2.0
+    reward_availability_weight: float = 10.0
+    reward_efficiency_weight: float = 1.0
+    reward_stability_weight: float = 0.5
+    reward_sla_bonus: float = 5.0
+    
+    # Advanced features
+    enable_multi_region: bool = True
+    enable_canary_deployment: bool = True
+    enable_auto_remediation: bool = True
+    enable_predictive_scaling: bool = False    # Agent should learn this
+    
+    # Observability
     enable_drift_tracking: bool = True
-    drift_window_size: int = 1000
+    drift_window_size: int = 2000
+    enable_audit_logging: bool = True
+    
+    # Circuit breaker (TUNED)
+    enable_circuit_breaker: bool = True
+    circuit_breaker_threshold: int = 50
+    circuit_breaker_window_seconds: int = 120
     
     # Seed
     seed: Optional[int] = None
     
-    # Audit & Logging
-    enable_audit_logging: bool = True
-    enable_metrics_export: bool = True
-    
-    # Advanced Features
-    enable_heterogeneous_workers: bool = True
-    enable_task_priorities: bool = True
-    enable_temporal_patterns: bool = True
+    # Live mode (not used in training)
+    redis_url: Optional[str] = None
+    dry_run: bool = True
 
-# ---------------------------
-# ENTERPRISE FEATURE: Circuit Breaker
-# ---------------------------
+# =============================================================================
+# WORKLOAD GENERATORS
+# =============================================================================
+
+class WorkloadGenerator:
+    """Generate realistic workload patterns"""
+    
+    def __init__(self, config: EnvConfig, rng: np.random.RandomState):
+        self.cfg = config
+        self.rng = rng
+        self.workload_type = WorkloadType(config.workload_type)
+        
+        # State
+        self.sim_time_minutes = 0.0
+        self.day_of_week = 1  # Monday
+        self.in_flash_crowd = False
+        self.flash_crowd_remaining = 0
+        
+    def get_arrival_rate(self) -> float:
+        """Compute current arrival rate with all modulations"""
+        
+        # Base rate
+        rate = self.cfg.base_arrival_rate
+        
+        # === DIURNAL PATTERN (24-hour cycle) ===
+        hour_of_day = (self.sim_time_minutes / 60.0) % 24.0
+        diurnal_factor = 1.0 + self.cfg.diurnal_amplitude * math.sin(
+            ((hour_of_day - self.cfg.diurnal_peak_hour) / 24.0) * 2 * math.pi
+        )
+        rate *= diurnal_factor
+        
+        # === WEEKLY PATTERN (weekday vs weekend) ===
+        if self.cfg.weekly_pattern:
+            if self.day_of_week in [6, 7]:  # Weekend
+                if self.workload_type == WorkloadType.ECOMMERCE:
+                    rate *= 1.3  # More shopping on weekends
+                elif self.workload_type == WorkloadType.STREAMING:
+                    rate *= 1.5  # More streaming on weekends
+            else:  # Weekday
+                if self.workload_type == WorkloadType.API_BACKEND:
+                    rate *= 1.2  # Business hours peak
+        
+        # === WORKLOAD-SPECIFIC PATTERNS ===
+        if self.workload_type == WorkloadType.ECOMMERCE:
+            # Black Friday simulation (rare mega-spike)
+            if self.rng.random() < 0.0001:  # Very rare
+                rate *= 50.0
+                LOG.warning("🛍️ BLACK FRIDAY EVENT! Traffic spike: %.0fx", 50.0)
+        
+        elif self.workload_type == WorkloadType.SOCIAL_MEDIA:
+            # Viral event simulation (bursty)
+            if self.rng.random() < 0.01:
+                viral_multiplier = self.rng.uniform(5.0, 20.0)
+                rate *= viral_multiplier
+                LOG.info("🔥 VIRAL EVENT! Traffic: %.1fx", viral_multiplier)
+        
+        elif self.workload_type == WorkloadType.STREAMING:
+            # Peak hours (evening)
+            if 18 <= hour_of_day <= 23:
+                rate *= 2.5
+        
+        elif self.workload_type == WorkloadType.GAMING:
+            # Tournament hours
+            if 19 <= hour_of_day <= 22:
+                rate *= 4.0
+        
+        # === FLASH CROWD (sustained spike) ===
+        if not self.in_flash_crowd:
+            if self.rng.random() < self.cfg.flash_crowd_probability:
+                self.in_flash_crowd = True
+                self.flash_crowd_remaining = self.cfg.flash_crowd_duration_steps
+                LOG.warning("⚡ FLASH CROWD started! Duration: %d steps", 
+                           self.flash_crowd_remaining)
+        
+        if self.in_flash_crowd:
+            rate *= self.cfg.flash_crowd_multiplier
+            self.flash_crowd_remaining -= 1
+            if self.flash_crowd_remaining <= 0:
+                self.in_flash_crowd = False
+                LOG.info("✅ Flash crowd ended")
+        
+        # === RANDOM NOISE ===
+        noise = self.rng.lognormal(0, 0.2)  # Multiplicative noise
+        rate *= noise
+        
+        return max(0.0, rate)
+    
+    def advance_time(self, minutes: float = 1.0):
+        """Advance simulation time"""
+        self.sim_time_minutes += minutes
+        
+        # Update day of week (every 24 hours)
+        if self.sim_time_minutes >= 1440:  # 24 hours
+            self.sim_time_minutes = 0
+            self.day_of_week = (self.day_of_week % 7) + 1
+
+# =============================================================================
+# WORKER POOL MANAGEMENT
+# =============================================================================
+
+@dataclass
+class Worker:
+    """Individual worker with state"""
+    id: str
+    tier: WorkerTier
+    efficiency: float
+    startup_remaining: int
+    is_healthy: bool
+    failure_mode: Optional[FailureMode]
+    tasks_processed: int
+    created_at: float
+
+class WorkerPool:
+    """Manage heterogeneous worker pool"""
+    
+    def __init__(self, config: EnvConfig, rng: np.random.RandomState):
+        self.cfg = config
+        self.rng = rng
+        self.workers: List[Worker] = []
+        self.next_worker_id = 0
+        
+    def add_workers(self, count: int) -> int:
+        """Add new workers (returns actual count added)"""
+        added = 0
+        for _ in range(count):
+            if len(self.workers) >= self.cfg.max_workers:
+                break
+            
+            # Determine tier (prefer spot instances)
+            if self.rng.random() < self.cfg.spot_instance_probability:
+                tier = WorkerTier.SPOT
+            else:
+                tier = WorkerTier.ON_DEMAND
+            
+            # Sample efficiency from distribution
+            efficiency = max(0.1, self.rng.normal(
+                self.cfg.worker_efficiency_mean,
+                self.cfg.worker_efficiency_std
+            ))
+            
+            worker = Worker(
+                id=f"worker_{self.next_worker_id}",
+                tier=tier,
+                efficiency=efficiency,
+                startup_remaining=self.cfg.worker_startup_time_steps,
+                is_healthy=True,
+                failure_mode=None,
+                tasks_processed=0,
+                created_at=time.time()
+            )
+            
+            self.workers.append(worker)
+            self.next_worker_id += 1
+            added += 1
+        
+        return added
+    
+    def remove_workers(self, count: int) -> int:
+        """Remove workers (returns actual count removed)"""
+        to_remove = min(count, len(self.workers))
+        
+        # Prefer removing unhealthy or spot workers first
+        self.workers.sort(key=lambda w: (
+            w.is_healthy,
+            w.tier != WorkerTier.SPOT,
+            -w.tasks_processed
+        ))
+        
+        self.workers = self.workers[to_remove:]
+        return to_remove
+    
+    def update_workers(self, overload_factor: float):
+        """Update worker states (failures, warmup, etc.)"""
+        
+        # Process startup warmup
+        for w in self.workers:
+            if w.startup_remaining > 0:
+                w.startup_remaining -= 1
+        
+        # Spot instance preemptions
+        for w in self.workers:
+            if w.tier == WorkerTier.SPOT:
+                if self.rng.random() < self.cfg.spot_preemption_rate:
+                    w.is_healthy = False
+                    w.failure_mode = FailureMode.CRASH
+                    LOG.debug("💀 Spot instance preempted: %s", w.id)
+        
+        # Failure injection (increases with overload)
+        failure_rate = self.cfg.base_failure_rate * (1.0 + overload_factor * self.cfg.overload_failure_multiplier)
+        
+        for w in self.workers:
+            if not w.is_healthy:
+                continue
+            
+            if self.rng.random() < failure_rate:
+                # Choose failure mode
+                failure_roll = self.rng.random()
+                if failure_roll < 0.05:
+                    w.failure_mode = FailureMode.BYZANTINE
+                elif failure_roll < 0.3:
+                    w.failure_mode = FailureMode.SLOW
+                elif failure_roll < 0.5:
+                    w.failure_mode = FailureMode.NETWORK
+                elif failure_roll < 0.7:
+                    w.failure_mode = FailureMode.OOM
+                else:
+                    w.failure_mode = FailureMode.CRASH
+                
+                w.is_healthy = False
+                LOG.debug("💥 Worker failure: %s (%s)", w.id, w.failure_mode.value)
+        
+        # Remove crashed workers
+        self.workers = [w for w in self.workers if w.failure_mode != FailureMode.CRASH]
+    
+    def get_effective_capacity(self) -> float:
+        """Compute total processing capacity"""
+        capacity = 0.0
+        
+        for w in self.workers:
+            if not w.is_healthy:
+                if w.failure_mode == FailureMode.SLOW:
+                    capacity += w.efficiency * 0.2  # 20% capacity
+                # Byzantine/Network/OOM contribute 0
+            elif w.startup_remaining > 0:
+                capacity += w.efficiency * 0.5  # 50% during warmup
+            else:
+                capacity += w.efficiency
+        
+        return capacity * self.cfg.worker_capacity_per_sec
+    
+    def get_cost_per_second(self) -> float:
+        """Compute current cost rate"""
+        cost = 0.0
+        for w in self.workers:
+            if w.tier == WorkerTier.SPOT:
+                cost += self.cfg.cost_spot_per_sec
+            elif w.tier == WorkerTier.ON_DEMAND:
+                cost += self.cfg.cost_on_demand_per_sec
+            else:
+                cost += self.cfg.cost_reserved_per_sec
+        return cost
+    
+    def count_healthy(self) -> int:
+        return sum(1 for w in self.workers if w.is_healthy and w.startup_remaining == 0)
+    
+    def count_total(self) -> int:
+        return len(self.workers)
+
+# =============================================================================
+# CIRCUIT BREAKER
+# =============================================================================
+
 class CircuitBreaker:
-    """
-    Thread-safe circuit breaker for failure protection.
-    TUNED: More forgiving for RL training environments.
-    """
-    def __init__(self, threshold: int = 20, window_seconds: int = 60):
+    def __init__(self, threshold: int = 50, window_seconds: int = 120):
         self.threshold = threshold
         self.window_seconds = window_seconds
         self.failures = deque()
-        self.successes = deque()  # Track successes too
-        self.state = "CLOSED"  # CLOSED | OPEN | HALF_OPEN
+        self.successes = deque()
+        self.state = "CLOSED"
         self.last_state_change = time.time()
         self.lock = threading.Lock()
-        self.half_open_attempts = 0
-        self.max_half_open_attempts = 3
         LOG.info("🔌 Circuit breaker initialized (threshold=%d, window=%ds)",
                 threshold, window_seconds)
     
     def record_failure(self):
-        """Record a failure and potentially open circuit."""
         with self.lock:
             now = time.time()
             self.failures.append(now)
             
-            # Prune old failures
             cutoff = now - self.window_seconds
-            while self.failures and self.failures[0] < cutoff:
-                self.failures.popleft()
+            self.failures = deque([t for t in self.failures if t > cutoff])
             
-            # Only open if failures significantly exceed successes
             recent_successes = sum(1 for t in self.successes if t > cutoff)
             failure_rate = len(self.failures) / max(1, len(self.failures) + recent_successes)
             
-            if len(self.failures) >= self.threshold and failure_rate > 0.8 and self.state == "CLOSED":
-                self.state = "OPEN"
-                self.last_state_change = now
-                self.half_open_attempts = 0
-                LOG.error("⚠️ CIRCUIT BREAKER OPENED - Too many failures (%d/%d, rate=%.1f%%)",
-                         len(self.failures), len(self.failures) + recent_successes, failure_rate * 100)
-                write_audit_event({
-                    "event": "circuit_breaker_opened",
-                    "failures": len(self.failures),
-                    "failure_rate": failure_rate
-                })
+            if len(self.failures) >= self.threshold and failure_rate > 0.7:
+                if self.state == "CLOSED":
+                    self.state = "OPEN"
+                    self.last_state_change = now
+                    LOG.error("⚠️ CIRCUIT BREAKER OPENED")
     
     def record_success(self):
-        """Record a success and potentially close circuit."""
         with self.lock:
             now = time.time()
             self.successes.append(now)
             
-            # Prune old successes
             cutoff = now - self.window_seconds
-            while self.successes and self.successes[0] < cutoff:
-                self.successes.popleft()
-            
-            if self.state == "HALF_OPEN":
-                self.half_open_attempts += 1
-                if self.half_open_attempts >= self.max_half_open_attempts:
-                    self.state = "CLOSED"
-                    self.failures.clear()
-                    self.half_open_attempts = 0
-                    LOG.info("✅ Circuit breaker CLOSED - System recovered")
-                    write_audit_event({
-                        "event": "circuit_breaker_closed"
-                    })
+            self.successes = deque([t for t in self.successes if t > cutoff])
     
     def can_execute(self) -> bool:
-        """Check if actions are allowed."""
         with self.lock:
             now = time.time()
             
-            # Auto-recover to HALF_OPEN after window
             if self.state == "OPEN" and (now - self.last_state_change) > self.window_seconds:
                 self.state = "HALF_OPEN"
-                self.last_state_change = now
-                self.half_open_attempts = 0
-                LOG.info("🔄 Circuit breaker HALF_OPEN - Testing recovery")
+                LOG.info("🔄 Circuit breaker HALF_OPEN")
             
             return self.state != "OPEN"
 
-# ---------------------------
-# ENTERPRISE FEATURE: Drift Tracker
-# ---------------------------
+# =============================================================================
+# DRIFT TRACKER
+# =============================================================================
+
 class DriftTracker:
-    """
-    Track observation and reward distributions for drift detection.
-    Thread-safe implementation.
-    """
-    def __init__(self, window_size: int = 1000):
+    def __init__(self, window_size: int = 2000):
         self.window_size = window_size
         self.obs_buffer = deque(maxlen=window_size)
         self.reward_buffer = deque(maxlen=window_size)
@@ -346,214 +566,137 @@ class DriftTracker:
         LOG.info("📊 Drift tracker initialized (window=%d)", window_size)
     
     def add_sample(self, obs: np.ndarray, reward: float):
-        """Add observation and reward sample (thread-safe)."""
         with self.lock:
-            if isinstance(obs, np.ndarray):
-                self.obs_buffer.append(obs.copy())
-            else:
-                self.obs_buffer.append(np.array(obs))
-            
+            self.obs_buffer.append(obs.copy() if isinstance(obs, np.ndarray) else np.array(obs))
             self.reward_buffer.append(float(reward))
             
-            # Establish baseline after first window
             if len(self.obs_buffer) == self.window_size and self.baseline_obs_stats is None:
                 self._compute_baseline()
     
     def _compute_baseline(self):
-        """Compute baseline statistics (called under lock)."""
-        if len(self.obs_buffer) < self.window_size:
-            return
-        
         obs_array = np.array(list(self.obs_buffer))
         reward_array = np.array(list(self.reward_buffer))
         
         self.baseline_obs_stats = {
             "mean": np.mean(obs_array, axis=0),
-            "std": np.std(obs_array, axis=0),
-            "min": np.min(obs_array, axis=0),
-            "max": np.max(obs_array, axis=0)
+            "std": np.std(obs_array, axis=0)
         }
         
         self.baseline_reward_stats = {
             "mean": float(np.mean(reward_array)),
-            "std": float(np.std(reward_array)),
-            "p50": float(np.percentile(reward_array, 50)),
-            "p95": float(np.percentile(reward_array, 95))
+            "std": float(np.std(reward_array))
         }
         
-        LOG.info("📊 Baseline established - reward_mean=%.3f obs_mean=%s",
-                self.baseline_reward_stats["mean"],
-                self.baseline_obs_stats["mean"][:3])
+        LOG.info("📊 Baseline established - reward_mean=%.3f",
+                self.baseline_reward_stats["mean"])
     
     def get_drift_score(self) -> Optional[float]:
-        """Compute drift score (thread-safe)."""
         with self.lock:
             if self.baseline_reward_stats is None or len(self.reward_buffer) < self.window_size:
                 return None
             
-            current_reward_mean = np.mean(list(self.reward_buffer))
+            current_mean = np.mean(list(self.reward_buffer))
             baseline_mean = self.baseline_reward_stats["mean"]
             baseline_std = self.baseline_reward_stats["std"]
             
-            drift_score = abs(current_reward_mean - baseline_mean) / (baseline_std + 1e-8)
-            return float(drift_score)
-    
-    def export_baseline(self) -> Dict[str, Any]:
-        """Export baseline for evaluation (thread-safe)."""
-        with self.lock:
-            if self.baseline_obs_stats is None:
-                return {}
-            
-            return {
-                "observations": [obs.tolist() for obs in list(self.obs_buffer)],
-                "rewards": list(self.reward_buffer),
-                "baseline_obs_stats": {
-                    k: v.tolist() if isinstance(v, np.ndarray) else v
-                    for k, v in self.baseline_obs_stats.items()
-                },
-                "baseline_reward_stats": self.baseline_reward_stats
-            }
+            return float(abs(current_mean - baseline_mean) / (baseline_std + 1e-8))
 
-# ---------------------------
-# Action/Observation Spaces (SYNCHRONIZED)
-# ---------------------------
+# =============================================================================
+# OBSERVATION/ACTION SPACES
+# =============================================================================
+
 def get_action_space() -> Any:
-    """
-    CRITICAL SYNC POINT: Must match train_rl_heavy.py
-    Action: [delta_workers, throttle_scale, priority_bias]
-    """
-    low = np.array([-10.0, 0.0, -2.0], dtype=np.float32)
-    high = np.array([10.0, 1.0, 2.0], dtype=np.float32)
+    """Action: [delta_workers, throttle_scale, priority_bias]"""
+    low = np.array([-20.0, 0.0, -2.0], dtype=np.float32)
+    high = np.array([20.0, 1.0, 2.0], dtype=np.float32)
     
     if _HAS_GYM:
         return spaces.Box(low=low, high=high, dtype=np.float32)
-    else:
-        return {"low": low, "high": high, "shape": (3,)}
+    return {"low": low, "high": high, "shape": (3,)}
 
-def get_observation_space(obs_dim: int = 8) -> Any:
-    """
-    CRITICAL SYNC POINT: Must match train_rl_heavy.py
-    Default: [queue, workers, avg_lat, p95_lat, success, arrival, cpu, mem]
-    """
+def get_observation_space(obs_dim: int = 12) -> Any:
+    """Extended observation space (12D)"""
     low = np.zeros(obs_dim, dtype=np.float32)
-    high = np.array([1e6, 1e4, 1e6, 1e6, 1.0, 1e3, 1.0, 1.0], dtype=np.float32)[:obs_dim]
+    high = np.array([
+        1e6,   # queue
+        1e4,   # workers
+        1e6,   # avg_lat
+        1e6,   # p95_lat
+        1.0,   # success
+        1e3,   # arrival
+        1.0,   # cpu
+        1.0,   # mem
+        1e6,   # p99_lat (NEW)
+        1e3,   # cost_rate (NEW)
+        1.0,   # worker_health (NEW)
+        1e3    # queue_growth_rate (NEW)
+    ], dtype=np.float32)[:obs_dim]
     
-    # Pad if obs_dim > 8
-    if obs_dim > 8:
+    if obs_dim > len(high):
         high = np.pad(high, (0, obs_dim - len(high)), constant_values=1e6)
     
     if _HAS_GYM:
         return spaces.Box(low=low, high=high, dtype=np.float32)
-    else:
-        return {"low": low, "high": high, "shape": (obs_dim,)}
+    return {"low": low, "high": high, "shape": (obs_dim,)}
 
-# ---------------------------
-# Base Environment (Enterprise Grade - FIXED)
-# ---------------------------
+# =============================================================================
+# BASE ENVIRONMENT
+# =============================================================================
+
 class RealEnvBase:
-    """
-    Base class for PriorityMax RL environments.
-    FIXED: All asyncio issues resolved, fully thread-safe.
-    """
+    """FAANG-level base environment"""
     
     def __init__(self, config: EnvConfig):
         self.cfg = config
-        self.random = random.Random(config.seed if config.seed is not None else int(time.time()))
-        self.npr = np.random.RandomState(config.seed if config.seed is not None else int(time.time()))
+        self.random = random.Random(config.seed)
+        self.npr = np.random.RandomState(config.seed)
         
-        # State tracking
+        # Determine obs_dim
+        if config.obs_dim is None:
+            config.obs_dim = 12
+        
+        # Spaces
+        self.action_space = get_action_space()
+        self.observation_space = get_observation_space(config.obs_dim)
+        
+        # State
         self.current_time = time.time()
         self.last_action_time = 0.0
-        self.last_scaling_action = 0
         self.step_count = 0
         self.episode_count = 0
         self.closed = False
         
-        # Runtime state (CRITICAL: matches training expectations)
-        self.state: Dict[str, Any] = {
-            "queue_length": 0.0,
-            "worker_count": float(max(1, config.min_workers or 1)),
-            "avg_latency_ms": 0.0,
-            "p95_latency_ms": 0.0,
-            "success_rate": 1.0,
-            "arrival_rate": 0.0,
-            "cpu": 0.0,
-            "mem": 0.0
-        }
-        
-        # Determine observation dimension
-        if config.obs_dim is None:
-            config.obs_dim = len(self.state)
-        
-        # Spaces (SYNCHRONIZED)
-        self.action_space = get_action_space()
-        self.observation_space = get_observation_space(config.obs_dim)
-        
         # Enterprise components
         self.circuit_breaker = CircuitBreaker(
-            threshold=config.circuit_breaker_threshold,
-            window_seconds=config.circuit_breaker_window_seconds
+            config.circuit_breaker_threshold,
+            config.circuit_breaker_window_seconds
         ) if config.enable_circuit_breaker else None
         
         self.drift_tracker = DriftTracker(
-            window_size=config.drift_window_size
+            config.drift_window_size
         ) if config.enable_drift_tracking else None
         
-        # Metrics history
+        # Metrics
         self.metrics_history: List[Dict[str, Any]] = []
+        self.sla_violations = 0
+        self.total_cost = 0.0
         
         # Thread safety
         self._lock = threading.Lock()
         
-        # Prometheus metrics (best-effort)
-        self._prom_registry = None
-        if _HAS_PROM and config.enable_metrics_export:
-            try:
-                self._prom_registry = CollectorRegistry()
-                self.prom_queue = Gauge("env_queue_length", "Queue length",
-                                       registry=self._prom_registry)
-                self.prom_workers = Gauge("env_worker_count", "Worker count",
-                                         registry=self._prom_registry)
-                self.prom_latency = Gauge("env_avg_latency_ms", "Average latency",
-                                         registry=self._prom_registry)
-                self.prom_reward = Gauge("env_reward", "Last reward",
-                                        registry=self._prom_registry)
-                self.prom_steps = Counter("env_steps_total", "Total steps",
-                                         registry=self._prom_registry)
-            except Exception:
-                self._prom_registry = None
-        
-        # Shutdown hooks
+        # Cleanup
         atexit.register(self._cleanup)
-        
-        # Signal handlers (safe registration)
-        try:
-            signal.signal(signal.SIGTERM, self._signal_handler)
-            signal.signal(signal.SIGINT, self._signal_handler)
-        except:
-            pass  # May fail in non-main threads
         
         LOG.info("✅ Environment initialized (mode=%s, obs_dim=%d, act_dim=%d)",
                 config.mode, config.obs_dim, config.act_dim)
     
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals gracefully."""
-        LOG.warning("⚠️ Received signal %d, cleaning up...", signum)
-        self._cleanup()
-        sys.exit(0)
-    
     def _cleanup(self):
-        """Cleanup resources on shutdown."""
         if not self.closed:
             self.close()
     
-    # ---------------------------
-    # Gym API (SYNCHRONIZED - FIXED)
-    # ---------------------------
+    # === GYM API ===
+    
     def reset(self, seed: Optional[int] = None) -> np.ndarray:
-        """
-        FIXED: Reset without asyncio dependencies.
-        """
         with self._lock:
             if seed is not None:
                 self.random.seed(seed)
@@ -561,21 +704,17 @@ class RealEnvBase:
             
             self.current_time = time.time()
             self.last_action_time = 0.0
-            self.last_scaling_action = 0
             self.step_count = 0
             self.episode_count += 1
             self.closed = False
+            self.sla_violations = 0
+            self.total_cost = 0.0
             
-            # Reset state (subclass-specific)
             self._reset_state()
             
-            # Get initial observation
             obs = self._observe()
-            
-            # Clear metrics
             self.metrics_history.clear()
             
-            # FIXED: Synchronous audit logging
             if self.cfg.enable_audit_logging:
                 write_audit_event({
                     "event": "env_reset",
@@ -585,126 +724,88 @@ class RealEnvBase:
             
             return obs
     
-    def step(self, action: Union[np.ndarray, List[float], Tuple, Dict[str, Any]]) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        """
-        FIXED: Step without asyncio dependencies.
-        """
+    def step(self, action: Union[np.ndarray, List, Tuple, Dict]) -> Tuple[np.ndarray, float, bool, Dict]:
         with self._lock:
             self.step_count += 1
             now = time.time()
             self.current_time = now
             
-            # Parse action
             parsed_action = self._parse_action(action)
             
-            # Safety checks
             if not self._safety_checks(parsed_action):
                 parsed_action = {"delta_workers": 0, "throttle": 0.0, "priority_bias": 0}
             
-            # Apply action
             exec_result = self._apply_action(
                 parsed_action["delta_workers"],
                 parsed_action["throttle"],
                 parsed_action["priority_bias"]
             )
             
-            # Advance world
             self._advance_world(
                 parsed_action["throttle"],
                 exec_result.get("applied_delta", 0),
                 parsed_action["priority_bias"]
             )
             
-            # Get observation
             obs = self._observe()
-            
-            # Compute reward
             reward, reward_details = self.compute_reward(exec_result)
-            
-            # Check termination
             done = self._terminal_condition()
             
-            # Update tracking
             if self.drift_tracker:
                 self.drift_tracker.add_sample(obs, reward)
             
-            # Update Prometheus metrics (best-effort)
-            if self._prom_registry:
-                try:
-                    self.prom_queue.set(self.state["queue_length"])
-                    self.prom_workers.set(self.state["worker_count"])
-                    self.prom_latency.set(self.state["avg_latency_ms"])
-                    self.prom_reward.set(reward)
-                    self.prom_steps.inc()
-                except Exception:
-                    pass
-            
-            # Build info
             info = {
                 "exec": exec_result,
                 "reward_details": reward_details,
                 "step": self.step_count,
                 "episode": self.episode_count,
                 "timestamp": now,
-                "state": self.state.copy(),
+                "sla_violations": self.sla_violations,
+                "total_cost": self.total_cost,
                 "circuit_breaker_ok": self.circuit_breaker.can_execute() if self.circuit_breaker else True,
                 "drift_score": self.drift_tracker.get_drift_score() if self.drift_tracker else None
             }
             
-            # Record metrics
             self.metrics_history.append({
                 "ts": now,
-                **self.state,
                 "action": parsed_action,
                 "reward": reward
             })
             
-            # Update last action time
             if parsed_action["delta_workers"] != 0:
                 self.last_action_time = now
-                self.last_scaling_action = parsed_action["delta_workers"]
             
             return obs, float(reward), bool(done), info
     
     def render(self, mode: str = "human") -> Optional[str]:
-        """Render environment state."""
-        output = (
-            f"[Step {self.step_count}] "
-            f"Queue={self.state['queue_length']:.0f} "
-            f"Workers={self.state['worker_count']:.0f} "
-            f"Latency(avg/p95)={self.state['avg_latency_ms']:.1f}/{self.state['p95_latency_ms']:.1f}ms "
-            f"Success={self.state['success_rate']:.2%}"
-        )
+        output = f"[Step {self.step_count}] SLA violations: {self.sla_violations} Total cost: ${self.total_cost:.2f}"
         
         if mode == "human":
             print(output)
             return None
-        else:
-            return output
+        return output
     
     def close(self):
-        """Close environment and cleanup resources."""
         if self.closed:
             return
         
         self.closed = True
         
-        # FIXED: Synchronous audit logging
         if self.cfg.enable_audit_logging:
             write_audit_event({
                 "event": "env_closed",
                 "total_steps": self.step_count,
-                "total_episodes": self.episode_count
+                "total_episodes": self.episode_count,
+                "total_cost": self.total_cost,
+                "sla_violations": self.sla_violations
             })
         
-        LOG.info("Environment closed (steps=%d, episodes=%d)",
-                self.step_count, self.episode_count)
+        LOG.info("Environment closed (steps=%d, episodes=%d, cost=$%.2f)",
+                self.step_count, self.episode_count, self.total_cost)
     
-    # ---------------------------
-    # Action Parsing (SYNCHRONIZED)
-    # ---------------------------
-    def _parse_action(self, action: Union[np.ndarray, List[float], Tuple, Dict[str, Any]]) -> Dict[str, Any]:
-        """Parse action into structured format."""
+    # === ACTION PARSING ===
+    
+    def _parse_action(self, action: Union[np.ndarray, List, Tuple, Dict]) -> Dict[str, Any]:
         if isinstance(action, dict):
             return {
                 "delta_workers": action.get("delta_workers", 0),
@@ -712,141 +813,346 @@ class RealEnvBase:
                 "priority_bias": action.get("priority_bias", 0)
             }
         
-        # Convert to array
         arr = np.asarray(action, dtype=float).flatten()
-        
-        # Pad if needed
         if arr.size < 3:
             arr = np.pad(arr, (0, 3 - arr.size), constant_values=0)
         
         return {
-            "delta_workers": int(np.round(arr[0])),
+            "delta_workers": int(np.clip(np.round(arr[0]), -self.cfg.max_scale_delta, self.cfg.max_scale_delta)),
             "throttle": float(np.clip(arr[1], 0.0, 1.0)),
-            "priority_bias": int(np.round(arr[2]))
+            "priority_bias": int(np.clip(np.round(arr[2]), -2, 2))
         }
     
-    # ---------------------------
-    # Safety Checks (ENTERPRISE)
-    # ---------------------------
+    # === SAFETY CHECKS ===
+    
     def _safety_checks(self, action: Dict[str, Any]) -> bool:
-        """Perform safety checks before executing action."""
         now = time.time()
         
-        # Cooldown check
         if (now - self.last_action_time) < self.cfg.action_cooldown_seconds:
             if action["delta_workers"] != 0:
-                LOG.debug("Action cooldown active (%.1fs remaining)",
-                         self.cfg.action_cooldown_seconds - (now - self.last_action_time))
                 return False
         
-        # Circuit breaker check
         if self.circuit_breaker and not self.circuit_breaker.can_execute():
             LOG.warning("⚠️ Circuit breaker OPEN - action blocked")
             return False
         
-        # Bounds check
-        new_workers = self.state["worker_count"] + action["delta_workers"]
-        if new_workers < self.cfg.min_workers or new_workers > self.cfg.max_workers:
-            LOG.debug("Action would violate worker bounds (%d not in [%d, %d])",
-                     new_workers, self.cfg.min_workers, self.cfg.max_workers)
-            return False
-        
         return True
     
-    # ---------------------------
-    # Action Application (FIXED - to override)
-    # ---------------------------
+    # === ABSTRACT METHODS (override in subclasses) ===
+    
+    def _reset_state(self):
+        raise NotImplementedError
+    
     def _apply_action(self, delta_workers: int, throttle: float, priority_bias: int) -> Dict[str, Any]:
-        """
-        FIXED: Apply action without asyncio dependencies.
-        Override in subclasses for live mode.
-        """
+        raise NotImplementedError
+    
+    def _advance_world(self, throttle: float, applied_delta: int, priority_bias: int):
+        raise NotImplementedError
+    
+    def _observe(self) -> np.ndarray:
+        raise NotImplementedError
+    
+    def compute_reward(self, exec_result: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
+        raise NotImplementedError
+    
+    def _terminal_condition(self) -> bool:
+        raise NotImplementedError
+
+# =============================================================================
+# SIMULATED ENVIRONMENT (FAANG-LEVEL COMPLEXITY)
+# =============================================================================
+
+class SimulatedRealEnv(RealEnvBase):
+    """
+    Hyper-realistic production environment simulator.
+    Models complex distributed systems at scale.
+    """
+    
+    def __init__(self, config: EnvConfig):
+        super().__init__(config)
+        
+        # Advanced components
+        self.workload_gen = WorkloadGenerator(config, self.npr)
+        self.worker_pool = WorkerPool(config, self.npr)
+        
+        # State tracking
+        self.state = {
+            "queue_length": 0.0,
+            "worker_count": 0.0,
+            "healthy_workers": 0.0,
+            "avg_latency_ms": 0.0,
+            "p95_latency_ms": 0.0,
+            "p99_latency_ms": 0.0,
+            "success_rate": 1.0,
+            "arrival_rate": 0.0,
+            "cpu": 0.0,
+            "mem": 0.0,
+            "cost_rate": 0.0,
+            "queue_growth_rate": 0.0
+        }
+        
+        # Latency tracking for percentiles
+        self.recent_latencies = deque(maxlen=1000)
+        
+        # Queue history for growth rate
+        self.queue_history = deque(maxlen=10)
+        
+        # Cascade failure state
+        self.cascade_failure_active = False
+        self.cascade_failure_countdown = 0
+        
+    def _reset_state(self):
+        """Reset with CHALLENGING initial conditions"""
+        
+        # Start with realistic load
+        initial_queue = self.npr.randint(200, 800)
+        initial_workers = self.npr.randint(10, 30)
+        
+        self.state.update({
+            "queue_length": float(initial_queue),
+            "worker_count": float(initial_workers),
+            "healthy_workers": float(initial_workers),
+            "avg_latency_ms": self.cfg.base_latency_ms * 2.0,
+            "p95_latency_ms": self.cfg.base_latency_ms * 3.0,
+            "p99_latency_ms": self.cfg.base_latency_ms * 5.0,
+            "success_rate": 0.92,  # Start with some failures
+            "arrival_rate": self.cfg.base_arrival_rate,
+            "cpu": 0.3,
+            "mem": 0.25,
+            "cost_rate": 0.0,
+            "queue_growth_rate": 0.0
+        })
+        
+        # Initialize worker pool
+        self.worker_pool = WorkerPool(self.cfg, self.npr)
+        self.worker_pool.add_workers(initial_workers)
+        
+        # Reset workload generator
+        self.workload_gen = WorkloadGenerator(self.cfg, self.npr)
+        self.workload_gen.sim_time_minutes = self.npr.uniform(0, 1440)  # Random time of day
+        self.workload_gen.day_of_week = self.npr.randint(1, 8)
+        
+        # Clear tracking
+        self.recent_latencies.clear()
+        self.queue_history.clear()
+        self.cascade_failure_active = False
+        self.cascade_failure_countdown = 0
+        
+        LOG.info("🎬 Episode %d started: queue=%d workers=%d arrival_rate=%.1f",
+                self.episode_count, initial_queue, initial_workers, 
+                self.workload_gen.get_arrival_rate())
+    
+    def _apply_action(self, delta_workers: int, throttle: float, priority_bias: int) -> Dict[str, Any]:
+        """Apply scaling action"""
+        
         attempt = {
             "wanted_delta": delta_workers,
             "applied_delta": 0,
             "throttle": throttle,
             "priority_bias": priority_bias,
-            "message": None,
+            "message": "applied",
             "ts": time.time()
         }
-
-        # Enforce worker bounds
-        new_worker_count = int(
-            np.clip(
-                self.state["worker_count"] + delta_workers,
-                self.cfg.min_workers,
-                self.cfg.max_workers
-            )
-        )
-        attempt["applied_delta"] = int(new_worker_count - self.state["worker_count"])
-
-        # Live mode handling (FIXED - synchronous)
-        if self.cfg.mode == "live" and not self.cfg.dry_run:
-            intent = {
-                "id": str(uuid.uuid4()),
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "type": "scale_action",
-                "delta": attempt["applied_delta"],
-                "throttle": throttle,
-                "priority_bias": priority_bias
-            }
-
-            try:
-                # FIXED: Synchronous Redis operation
-                if _HAS_REDIS and self.cfg.redis_url:
-                    try:
-                        r = redis.from_url(self.cfg.redis_url, decode_responses=True)
-                        r.lpush("prioritymax:scale_intents", json.dumps(intent))
-                        r.close()
-                        attempt["message"] = "intent_pushed_to_redis"
-                    except Exception as e:
-                        LOG.debug("Redis push failed: %s", e)
-                        # Fallback to file
-                        p = pathlib.Path(tempfile.gettempdir()) / f"intent_{intent['id']}.json"
-                        p.write_text(json.dumps(intent))
-                        attempt["message"] = "intent_written_to_file"
-                else:
-                    # Fallback to local file intent
-                    p = pathlib.Path(tempfile.gettempdir()) / f"intent_{intent['id']}.json"
-                    p.write_text(json.dumps(intent))
-                    attempt["message"] = "intent_written_to_file"
-                
-                # FIXED: Synchronous audit logging
-                write_audit_event({
-                    "event": "live_scale_intent",
-                    "intent": intent
-                })
-            except Exception as e:
-                LOG.exception("Failed to emit scale intent: %s", e)
-                attempt["message"] = f"intent_emit_failed: {e}"
-                if self.circuit_breaker:
-                    self.circuit_breaker.record_failure()
-        else:
-            # Simulation or dry run
-            attempt["message"] = "dry_run_or_simulated"
-
+        
+        # Apply worker scaling
+        if delta_workers > 0:
+            added = self.worker_pool.add_workers(delta_workers)
+            attempt["applied_delta"] = added
+            if added < delta_workers:
+                attempt["message"] = f"hit_max_workers (added {added}/{delta_workers})"
+        elif delta_workers < 0:
+            removed = self.worker_pool.remove_workers(-delta_workers)
+            attempt["applied_delta"] = -removed
+            if removed < -delta_workers:
+                attempt["message"] = f"hit_min_workers (removed {removed}/{-delta_workers})"
+        
         return attempt
-
-    # ---------------------------
-    # WORLD DYNAMICS (SIMULATION - to override)
-    # ---------------------------
+    
     def _advance_world(self, throttle: float, applied_delta: int, priority_bias: int):
-        """
-        Advance simulation dynamics (override in subclasses).
-        Base implementation does nothing (for live mode).
-        """
-        pass
-
-    def _reset_state(self):
-        """Reset state to initial conditions (override in subclasses)."""
-        pass
-
-    # ---------------------------
-    # OBSERVATION VECTOR
-    # ---------------------------
+        """Advance simulation with full complexity"""
+        
+        # === 1. WORKLOAD ARRIVAL ===
+        arrival_rate = self.workload_gen.get_arrival_rate()
+        
+        # Throttle reduces arrivals (admission control)
+        effective_arrival_rate = arrival_rate * (1.0 - throttle)
+        
+        # Sample arrivals (Poisson process)
+        arrivals = self.npr.poisson(lam=effective_arrival_rate)
+        
+        # === 2. WORKER POOL UPDATE ===
+        
+        # Compute overload factor
+        capacity = self.worker_pool.get_effective_capacity()
+        overload_factor = max(0.0, (self.state["queue_length"] + arrivals - capacity) / max(1.0, capacity))
+        
+        # Update workers (failures, preemptions, etc.)
+        self.worker_pool.update_workers(overload_factor)
+        
+        # Update capacity after failures
+        capacity = self.worker_pool.get_effective_capacity()
+        
+        # === 3. QUEUE DYNAMICS ===
+        
+        old_queue = self.state["queue_length"]
+        
+        # Add arrivals
+        self.state["queue_length"] += arrivals
+        
+        # Process tasks
+        if capacity > 0:
+            # Tasks that can be completed
+            completable = min(self.state["queue_length"], capacity)
+            
+            # Apply failure rate
+            failure_rate = self.cfg.base_failure_rate
+            
+            # Byzantine failures corrupt results
+            byzantine_workers = sum(1 for w in self.worker_pool.workers 
+                                   if w.failure_mode == FailureMode.BYZANTINE)
+            if byzantine_workers > 0:
+                failure_rate += 0.05 * (byzantine_workers / max(1, len(self.worker_pool.workers)))
+            
+            # Overload increases failures
+            if overload_factor > 2.0:
+                failure_rate *= self.cfg.overload_failure_multiplier
+            
+            # Cascade failure
+            if self.cascade_failure_active:
+                failure_rate *= 5.0
+                self.cascade_failure_countdown -= 1
+                if self.cascade_failure_countdown <= 0:
+                    self.cascade_failure_active = False
+                    LOG.info("✅ Cascade failure recovered")
+            
+            # Success rate
+            success_rate = max(0.0, 1.0 - failure_rate)
+            successful_completions = int(completable * success_rate)
+            
+            self.state["queue_length"] -= successful_completions
+            self.state["success_rate"] = success_rate
+        else:
+            self.state["success_rate"] = 0.0
+        
+        # Enforce max queue
+        if self.state["queue_length"] >= self.cfg.max_queue_size:
+            overflow = self.state["queue_length"] - self.cfg.max_queue_size
+            self.state["queue_length"] = self.cfg.max_queue_size
+            LOG.warning("⚠️ Queue overflow! Dropped %d tasks", int(overflow))
+        
+        # Queue growth rate
+        queue_growth = self.state["queue_length"] - old_queue
+        self.queue_history.append(queue_growth)
+        if len(self.queue_history) >= 5:
+            self.state["queue_growth_rate"] = np.mean(list(self.queue_history))
+        else:
+            self.state["queue_growth_rate"] = queue_growth
+        
+        # === 4. LATENCY MODELING ===
+        
+        if capacity > 0:
+            # Base latency
+            base_lat = self.cfg.base_latency_ms
+            
+            # Queueing delay (M/M/c approximation)
+            utilization = (arrival_rate / capacity) if capacity > 0 else 10.0
+            if utilization < 1.0:
+                queue_delay = (utilization / (1.0 - utilization)) * base_lat
+            else:
+                queue_delay = base_lat * 10.0  # Heavily overloaded
+            
+            # Per-item congestion
+            congestion_delay = self.state["queue_length"] * self.cfg.latency_per_queue_item
+            
+            # Network latency
+            network_delay = self.cfg.network_latency_ms
+            
+            # Total latency
+            total_latency = base_lat + queue_delay + congestion_delay + network_delay
+            
+            # Add noise
+            noise = self.npr.randn() * 0.1 * total_latency
+            total_latency = max(1.0, total_latency + noise)
+            
+            # Slow workers increase latency
+            slow_workers = sum(1 for w in self.worker_pool.workers 
+                              if w.failure_mode == FailureMode.SLOW)
+            if slow_workers > 0:
+                total_latency *= (1.0 + 0.5 * slow_workers / max(1, len(self.worker_pool.workers)))
+            
+            # Record latency sample
+            self.recent_latencies.append(total_latency)
+            
+            # Compute percentiles
+            if len(self.recent_latencies) >= 10:
+                sorted_lats = sorted(self.recent_latencies)
+                self.state["avg_latency_ms"] = float(np.mean(sorted_lats))
+                self.state["p95_latency_ms"] = float(sorted_lats[int(0.95 * len(sorted_lats))])
+                self.state["p99_latency_ms"] = float(sorted_lats[int(0.99 * len(sorted_lats))])
+            else:
+                self.state["avg_latency_ms"] = total_latency
+                self.state["p95_latency_ms"] = total_latency * 1.5
+                self.state["p99_latency_ms"] = total_latency * 2.0
+        else:
+            # No workers - latency explodes
+            self.state["avg_latency_ms"] = 10000.0
+            self.state["p95_latency_ms"] = 20000.0
+            self.state["p99_latency_ms"] = 30000.0
+        
+        # === 5. CASCADE FAILURE CHECK ===
+        
+        if not self.cascade_failure_active:
+            # SLA violation triggers cascade
+            if self.state["p95_latency_ms"] > self.cfg.sla_latency_p95_ms * 5.0:
+                if self.random.random() < self.cfg.cascade_failure_probability:
+                    self.cascade_failure_active = True
+                    self.cascade_failure_countdown = 20
+                    LOG.error("💥 CASCADE FAILURE triggered!")
+        
+        # === 6. RESOURCE UTILIZATION ===
+        
+        worker_count = self.worker_pool.count_total()
+        
+        # CPU: proportional to workers + queue pressure
+        self.state["cpu"] = min(1.0,
+            0.05 + 
+            0.02 * worker_count + 
+            0.0001 * self.state["queue_length"] +
+            self.npr.randn() * 0.03
+        )
+        
+        # Memory: similar
+        self.state["mem"] = min(1.0,
+            0.03 + 
+            0.015 * worker_count + 
+            0.00005 * self.state["queue_length"] +
+            self.npr.randn() * 0.02
+        )
+        
+        # === 7. COST TRACKING ===
+        
+        step_cost = self.worker_pool.get_cost_per_second()
+        self.state["cost_rate"] = step_cost
+        self.total_cost += step_cost
+        
+        # SLA violation penalty
+        if self.state["p95_latency_ms"] > self.cfg.sla_latency_p95_ms:
+            self.sla_violations += 1
+            self.total_cost += self.cfg.cost_sla_violation
+        
+        # === 8. STATE UPDATE ===
+        
+        self.state["worker_count"] = float(worker_count)
+        self.state["healthy_workers"] = float(self.worker_pool.count_healthy())
+        self.state["arrival_rate"] = arrival_rate
+        
+        # Advance time
+        self.workload_gen.advance_time(1.0)
+    
     def _observe(self) -> np.ndarray:
-        """Return normalized observation vector."""
-        arr = np.array([
+        """Return normalized observation vector"""
+        
+        obs = np.array([
             self.state["queue_length"],
             self.state["worker_count"],
             self.state["avg_latency_ms"],
@@ -854,402 +1160,244 @@ class RealEnvBase:
             self.state["success_rate"],
             self.state["arrival_rate"],
             self.state["cpu"],
-            self.state["mem"]
+            self.state["mem"],
+            self.state["p99_latency_ms"],
+            self.state["cost_rate"],
+            self.state["healthy_workers"] / max(1.0, self.state["worker_count"]),
+            self.state["queue_growth_rate"]
         ], dtype=np.float32)
         
-        # Ensure we match configured obs_dim
-        if self.cfg.obs_dim and len(arr) < self.cfg.obs_dim:
-            arr = np.pad(arr, (0, self.cfg.obs_dim - len(arr)), constant_values=0)
-        elif self.cfg.obs_dim and len(arr) > self.cfg.obs_dim:
-            arr = arr[:self.cfg.obs_dim]
+        # Match configured obs_dim
+        if self.cfg.obs_dim and len(obs) < self.cfg.obs_dim:
+            obs = np.pad(obs, (0, self.cfg.obs_dim - len(obs)), constant_values=0)
+        elif self.cfg.obs_dim and len(obs) > self.cfg.obs_dim:
+            obs = obs[:self.cfg.obs_dim]
         
-        return np.clip(arr, 0, 1e6)
-
-    # ---------------------------
-    # REWARD FUNCTION (SYNCED)
-    # ---------------------------
+        return obs
+    
     def compute_reward(self, exec_result: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
         """
-        FIXED VERSION with reward clipping.
+        FAANG-LEVEL REWARD FUNCTION
+        Multi-objective optimization with smooth, bounded components
         """
-        sla = self.cfg.reward_latency_sla_ms
-        lat = self.state["avg_latency_ms"]
-        succ = self.state["success_rate"]
-        q = self.state["queue_length"]
-        w = self.state["worker_count"]
+        
+        # Extract state
+        p50_lat = self.state["avg_latency_ms"]
+        p95_lat = self.state["p95_latency_ms"]
+        p99_lat = self.state["p99_latency_ms"]
+        succ_rate = self.state["success_rate"]
+        queue = self.state["queue_length"]
+        workers = self.state["worker_count"]
+        healthy_ratio = self.state["healthy_workers"] / max(1.0, workers)
+        cost_rate = self.state["cost_rate"]
         delta = exec_result.get("applied_delta", 0)
-        throttle = exec_result.get("throttle", 0.0)
-
-        # === Bounded penalties ===
-        # Latency penalty (capped)
-        lat_normalized = min(lat / max(sla, 1.0), 10.0)  # Cap at 10x SLA
-        latency_pen = -((max(0.0, lat_normalized - 1.0)) ** 2) * self.cfg.reward_latency_weight
-        latency_pen = max(latency_pen, -100.0)  # Floor at -100
-
-        # Queue penalty (capped)
-        queue_normalized = min(q / 1000.0, 10.0)  # Normalize
-        queue_pen = -math.log1p(queue_normalized) * self.cfg.reward_queue_weight
-        queue_pen = max(queue_pen, -50.0)  # Floor at -50
-
-        # Throughput reward (bounded)
-        throughput_reward = min(succ * w * self.cfg.reward_throughput_weight, 10.0)
-
-        # Cost penalty (bounded)
-        cost_pen = -min(w * self.cfg.cost_per_worker_per_sec * self.cfg.reward_cost_weight, 10.0)
-
-        # Stability penalty (bounded)
-        stability_pen = -min(abs(delta) * self.cfg.reward_stability_weight, 5.0)
-
-        # Throttle penalty (bounded)
-        throttle_pen = -min(throttle * 0.5, 5.0)
-
-        # Success bonus (bounded)
-        success_bonus = min(succ * self.cfg.reward_success_weight, 5.0)
-
-        # Sum all components
-        total = latency_pen + throughput_reward + cost_pen + queue_pen + stability_pen + throttle_pen + success_bonus
-
-        # SLA bonus
+        
+        # === COMPONENT 1: LATENCY (smooth penalties) ===
+        
+        # P95 latency penalty (primary SLA)
+        p95_target = self.cfg.sla_latency_p95_ms
+        if p95_lat <= p95_target:
+            latency_reward = 2.0  # Good!
+        else:
+            # Smooth penalty (not exponential)
+            overage_ratio = (p95_lat - p95_target) / p95_target
+            latency_reward = -min(10.0, overage_ratio * 2.0)
+        
+        latency_reward *= self.cfg.reward_latency_weight
+        
+        # === COMPONENT 2: AVAILABILITY (success rate) ===
+        
+        # Smooth sigmoid-like reward
+        if succ_rate >= self.cfg.sla_success_rate:
+            availability_reward = 3.0
+        else:
+            deficit = (self.cfg.sla_success_rate - succ_rate) / self.cfg.sla_success_rate
+            availability_reward = -min(10.0, deficit * 5.0)
+        
+        availability_reward *= self.cfg.reward_availability_weight
+        
+        # === COMPONENT 3: COST EFFICIENCY ===
+        
+        # Cost per successful request
+        successful_throughput = workers * healthy_ratio * succ_rate
+        if successful_throughput > 0:
+            cost_per_success = cost_rate / successful_throughput
+            cost_penalty = -min(5.0, cost_per_success * 10.0)
+        else:
+            cost_penalty = -5.0
+        
+        cost_penalty *= self.cfg.reward_cost_weight
+        
+        # === COMPONENT 4: QUEUE MANAGEMENT ===
+        
+        # Penalize queue buildup (smooth)
+        queue_ratio = queue / self.cfg.max_queue_size
+        if queue_ratio < 0.3:
+            queue_reward = 1.0
+        else:
+            queue_reward = -min(5.0, (queue_ratio - 0.3) * 10.0)
+        
+        # === COMPONENT 5: EFFICIENCY (worker utilization) ===
+        
+        # Target ~70% utilization
+        utilization = queue / max(1.0, workers * 10.0)  # Rough estimate
+        if 0.5 <= utilization <= 0.8:
+            efficiency_reward = 2.0
+        else:
+            efficiency_reward = -abs(utilization - 0.65) * 2.0
+        
+        efficiency_reward *= self.cfg.reward_efficiency_weight
+        
+        # === COMPONENT 6: STABILITY (minimize thrashing) ===
+        
+        stability_penalty = -min(2.0, abs(delta) * 0.1)
+        stability_penalty *= self.cfg.reward_stability_weight
+        
+        # === COMPONENT 7: SLA BONUS ===
+        
         sla_bonus = 0.0
-        if lat <= sla:
+        if (p95_lat <= p95_target and 
+            succ_rate >= self.cfg.sla_success_rate and
+            queue_ratio < 0.5):
             sla_bonus = self.cfg.reward_sla_bonus
-            total += sla_bonus
-
-        # ===== CRITICAL: CLIP FINAL REWARD =====
-        total = float(np.clip(total, -1000.0, 100.0))
-        # ========================================
-
-        # Circuit breaker (lenient)
+        
+        # === AGGREGATE REWARD ===
+        
+        total_reward = (
+            latency_reward +
+            availability_reward +
+            cost_penalty +
+            queue_reward +
+            efficiency_reward +
+            stability_penalty +
+            sla_bonus
+        )
+        
+        # === CRITICAL: BOUNDED REWARD ===
+        total_reward = float(np.clip(total_reward, -50.0, 50.0))
+        
+        # === CIRCUIT BREAKER UPDATE ===
+        
         if self.circuit_breaker:
-            if succ > 0.5 and lat < sla * 5.0:
+            if succ_rate > 0.9 and p95_lat < p95_target * 2.0:
                 self.circuit_breaker.record_success()
-
+            else:
+                self.circuit_breaker.record_failure()
+        
+        # === DETAILS ===
+        
         details = {
-            "latency_pen": float(latency_pen),
-            "throughput_reward": float(throughput_reward),
-            "cost_penalty": float(cost_pen),
-            "queue_penalty": float(queue_pen),
-            "stability_penalty": float(stability_pen),
-            "throttle_penalty": float(throttle_pen),
-            "success_bonus": float(success_bonus),
+            "latency_reward": float(latency_reward),
+            "availability_reward": float(availability_reward),
+            "cost_penalty": float(cost_penalty),
+            "queue_reward": float(queue_reward),
+            "efficiency_reward": float(efficiency_reward),
+            "stability_penalty": float(stability_penalty),
             "sla_bonus": float(sla_bonus),
-            "final_reward": total
+            "final_reward": total_reward,
+            "p95_sla_met": p95_lat <= p95_target,
+            "success_sla_met": succ_rate >= self.cfg.sla_success_rate
         }
-        return total, details
+        
+        return total_reward, details
     
-    # ---------------------------
-    # TERMINAL CONDITION
-    # ---------------------------
     def _terminal_condition(self) -> bool:
         """
-        Check if episode should terminate.
-        
-        FIXED: Much more lenient criteria for stable RL training.
-        - Increased thresholds significantly
-        - Added step limit to prevent infinite episodes  
-        - Only terminates on truly catastrophic failures
-        - Allows agent to learn from difficult situations
+        LENIENT termination criteria for stable RL training
         """
-        # Prevent infinite episodes with step limit
-        MAX_EPISODE_STEPS = 10000
-        if self.step_count >= MAX_EPISODE_STEPS:
-            LOG.info("Episode complete: reached max steps (%d)", MAX_EPISODE_STEPS)
+        
+        MAX_STEPS = 10000
+        if self.step_count >= MAX_STEPS:
+            LOG.info("Episode complete: reached max steps (%d)", MAX_STEPS)
             return True
         
-        # Define EXTREME failure thresholds (much more lenient than before)
-        catastrophic_latency = self.state["p95_latency_ms"] > 500000  # 500 seconds (was 100s)
-        catastrophic_queue = self.state["queue_length"] >= self.cfg.sim_max_queue * 0.999  # 99.9% full (was 99%)
-        complete_system_failure = self.state["success_rate"] < 0.01  # Less than 1% success rate
+        # Only terminate on CATASTROPHIC failures
         
-        # Only terminate if multiple failure conditions are met
-        should_terminate = (catastrophic_latency and catastrophic_queue) or complete_system_failure
+        # Complete system failure
+        if self.state["success_rate"] < 0.01 and self.state["worker_count"] < 5:
+            LOG.error("💀 Episode terminated: complete system failure")
+            return True
         
-        if should_terminate:
-            if self.circuit_breaker:
-                self.circuit_breaker.record_failure()
-            
-            LOG.warning(
-                "Episode terminated: lat=%.0fms queue=%.0f/%.0f success=%.2f%% step=%d",
-                self.state["p95_latency_ms"], 
-                self.state["queue_length"],
-                self.cfg.sim_max_queue,
-                self.state["success_rate"] * 100,
-                self.step_count
-            )
+        # Queue completely full for extended period
+        if (self.state["queue_length"] >= self.cfg.max_queue_size * 0.999 and
+            self.state["queue_growth_rate"] > 100):
+            LOG.error("💀 Episode terminated: queue overflow")
+            return True
+        
+        # Extreme latency with no recovery
+        if (self.state["p99_latency_ms"] > 100000 and  # 100 seconds
+            self.state["queue_length"] > self.cfg.max_queue_size * 0.9):
+            LOG.error("💀 Episode terminated: extreme latency")
             return True
         
         return False
-# ---------------------------------------------------
-# SIMULATED ENVIRONMENT (for training) - FIXED
-# ---------------------------------------------------
-class SimulatedRealEnv(RealEnvBase):
-    """
-    FIXED: Fully featured simulator with realistic dynamics.
-    No asyncio dependencies, fully thread-safe.
-    """
-    
-    def __init__(self, config: EnvConfig):
-        super().__init__(config)
-        # Additional simulation state
-        self.consumer_eff = []
-        self.sim_time_of_day = 0.0  # Minutes since midnight
-        
-    def _reset_state(self):
-        """Reset simulation state with safer initial conditions."""
-        self.state.update({
-            "queue_length": float(self.npr.randint(0, 20)),  # Lower initial queue
-            "worker_count": float(self.npr.randint(self.cfg.min_workers, self.cfg.min_workers + 3)),
-            "avg_latency_ms": float(self.cfg.sim_base_latency_ms * 0.8),  # Start with good latency
-            "p95_latency_ms": float(self.cfg.sim_base_latency_ms * 1.0),
-            "success_rate": 0.98,  # Start with high success rate
-            "arrival_rate": self.cfg.sim_queue_arrival_rate * 0.5,  # Start with lower load
-            "cpu": 0.15,
-            "mem": 0.15
-        })
-        
-        # Initialize heterogeneous worker efficiencies
-        if self.cfg.enable_heterogeneous_workers:
-            self.consumer_eff = [
-                self.npr.uniform(0.8, 1.2) 
-                for _ in range(int(self.state["worker_count"]))
-            ]
-        else:
-            self.consumer_eff = [1.0] * int(self.state["worker_count"])
-        
-        # Reset time of day
-        self.sim_time_of_day = datetime.utcnow().hour * 60.0 + datetime.utcnow().minute
-    
-    def _advance_world(self, throttle: float, applied_delta: int, priority_bias: int):
-        """
-        FIXED: Advance simulation with realistic dynamics.
-        Incorporates diurnal patterns, bursts, heterogeneity, and noise.
-        """
-        # Update worker count
-        old_workers = int(self.state["worker_count"])
-        self.state["worker_count"] = max(
-            self.cfg.min_workers,
-            min(self.cfg.max_workers, self.state["worker_count"] + applied_delta)
-        )
-        new_workers = int(self.state["worker_count"])
-        
-        # Update worker efficiencies
-        if self.cfg.enable_heterogeneous_workers:
-            if new_workers > old_workers:
-                # Add new workers
-                for _ in range(new_workers - old_workers):
-                    self.consumer_eff.append(self.npr.uniform(0.8, 1.2))
-            elif new_workers < old_workers:
-                # Remove workers
-                self.consumer_eff = self.consumer_eff[:new_workers]
-        
-        # Advance time of day
-        if self.cfg.enable_temporal_patterns:
-            self.sim_time_of_day += self.cfg.sim_time_step_minutes
-            if self.sim_time_of_day >= 1440:  # 24 hours
-                self.sim_time_of_day -= 1440
-        
-        # Arrival rate with diurnal pattern
-        if self.cfg.enable_temporal_patterns:
-            tod_hours = self.sim_time_of_day / 60.0
-            diurnal_factor = 1.0 + self.cfg.sim_diurnal_amplitude * math.sin(
-                (tod_hours / 24.0) * 2 * math.pi - math.pi / 2  # Peak at noon
-            )
-        else:
-            diurnal_factor = 1.0
-        
-        # Base arrival rate modulated by throttle
-        arrival_rate = max(0.0, self.cfg.sim_queue_arrival_rate * diurnal_factor * (1.0 - throttle))
 
-        # Random burst events
-        if self.random.random() < self.cfg.sim_burst_probability:
-            burst_multiplier = 1.0 + self.cfg.sim_burst_size / 10.0
-            arrival_rate *= burst_multiplier
-            LOG.debug("Burst event! arrival_rate=%.2f (x%.2f)", arrival_rate, burst_multiplier)
-
-        # Poisson arrivals
-        arrivals = self.npr.poisson(lam=arrival_rate)
-        
-        # Service capacity with worker heterogeneity
-        if self.cfg.enable_heterogeneous_workers and self.consumer_eff:
-            avg_efficiency = np.mean(self.consumer_eff[:new_workers])
-            service_capacity = max(1.0, new_workers * avg_efficiency)
-        else:
-            service_capacity = max(1.0, new_workers * self.random.uniform(0.8, 1.2))
-        
-        # Queue dynamics
-        completed = min(self.state["queue_length"] + arrivals, int(service_capacity))
-        self.state["queue_length"] = max(
-            0.0, 
-            min(self.cfg.sim_max_queue, self.state["queue_length"] + arrivals - completed)
-        )
-
-        # Latency model: increases with load
-        if service_capacity > 0:
-            load_factor = 1.0 + (self.state["queue_length"] / service_capacity)
-        else:
-            load_factor = 10.0
-        
-        noise = self.npr.randn() * self.cfg.sim_noise_scale * self.cfg.sim_base_latency_ms
-        base_latency = self.cfg.sim_base_latency_ms * load_factor + noise
-        self.state["avg_latency_ms"] = max(1.0, base_latency)
-        self.state["p95_latency_ms"] = base_latency * (1.0 + 0.4 * self.random.random())
-
-        # Success rate: degrades with overload
-        overload = max(0.0, self.state["queue_length"] - service_capacity)
-        fail_rate = min(0.5, self.cfg.sim_failure_rate + 0.001 * overload)
-        self.state["success_rate"] = max(0.0, 1.0 - fail_rate)
-
-        # Resource utilization
-        self.state["cpu"] = min(1.0, 
-            0.05 * self.state["worker_count"] + 
-            0.0005 * self.state["queue_length"] +
-            self.npr.randn() * 0.05
-        )
-        self.state["mem"] = min(1.0, 
-            0.02 * self.state["worker_count"] + 
-            0.0003 * self.state["queue_length"] +
-            self.npr.randn() * 0.02
-        )
-
-        # Update arrival rate observation
-        self.state["arrival_rate"] = arrival_rate
-
-# ---------------------------------------------------
-# LIVE ENVIRONMENT (for real ops) - FIXED
-# ---------------------------------------------------
-class LiveRealEnv(RealEnvBase):
-    """
-    FIXED: Bridge to live PriorityMax telemetry.
-    No asyncio dependencies, uses synchronous operations.
-    """
-    
-    def __init__(self, config: EnvConfig):
-        super().__init__(config)
-        self.metrics_cache_path = BASE_DIR / "live_metrics_cache.json"
-        
-    def _reset_state(self):
-        """Load initial state from live metrics cache."""
-        try:
-            if self.metrics_cache_path.exists():
-                data = json.loads(self.metrics_cache_path.read_text())
-                for k in self.state.keys():
-                    if k in data:
-                        self.state[k] = float(data[k])
-                LOG.info("Loaded live state from cache: workers=%.0f queue=%.0f",
-                        self.state["worker_count"], self.state["queue_length"])
-            else:
-                LOG.warning("No live metrics cache found, using defaults")
-                self.state["queue_length"] = 0.0
-                self.state["worker_count"] = float(self.cfg.min_workers)
-        except Exception as e:
-            LOG.warning("Live reset fallback due to error: %s", e)
-            self.state["queue_length"] = 0.0
-            self.state["worker_count"] = float(self.cfg.min_workers)
-
-    def _advance_world(self, throttle: float, applied_delta: int, priority_bias: int):
-        """
-        FIXED: Fetch live metrics synchronously.
-        Falls back to stale state if cache unavailable.
-        """
-        try:
-            if self.metrics_cache_path.exists():
-                data = json.loads(self.metrics_cache_path.read_text())
-                
-                # Update state from live metrics
-                for k, v in data.items():
-                    if k in self.state:
-                        self.state[k] = float(v)
-                
-                LOG.debug("Updated from live metrics: queue=%.0f workers=%.0f lat=%.1fms",
-                         self.state["queue_length"], 
-                         self.state["worker_count"],
-                         self.state["avg_latency_ms"])
-            else:
-                # Fallback: simple state evolution
-                LOG.debug("No live metrics, using fallback evolution")
-                self.state["worker_count"] = max(
-                    self.cfg.min_workers,
-                    min(self.cfg.max_workers, self.state["worker_count"] + applied_delta)
-                )
-                self.state["cpu"] = min(1.0, self.state["cpu"] + 0.01 * applied_delta)
-                self.state["mem"] = min(1.0, self.state["mem"] + 0.005 * applied_delta)
-                
-        except Exception as e:
-            LOG.debug("Live metrics fetch failed: %s", e)
-            # Keep stale state
-
-# ---------------------------------------------------
+# =============================================================================
 # FACTORY FUNCTIONS
-# ---------------------------------------------------
+# =============================================================================
+
 def make_env(cfg: EnvConfig) -> RealEnvBase:
-    """Factory function to create environment based on config."""
-    if cfg.mode == "live":
-        return LiveRealEnv(cfg)
-    else:
-        return SimulatedRealEnv(cfg)
+    """Factory to create environment"""
+    return SimulatedRealEnv(cfg)
 
 def make_vec_env(cfg: EnvConfig, n: int = 4) -> List[RealEnvBase]:
-    """
-    Create vectorized environments for parallel training.
-    FIXED: Each environment gets unique seed.
-    """
+    """Create vectorized environments"""
     envs = []
     base_seed = cfg.seed if cfg.seed is not None else int(time.time())
     
     for i in range(n):
-        # Create config copy with unique seed
         env_cfg = EnvConfig(**asdict(cfg))
         env_cfg.seed = base_seed + i
         envs.append(make_env(env_cfg))
     
     return envs
 
-# ---------------------------------------------------
-# HEALTH CHECK & DIAGNOSTICS
-# ---------------------------------------------------
+# =============================================================================
+# DIAGNOSTICS
+# =============================================================================
+
 def run_env_diagnostic(cfg: Optional[EnvConfig] = None) -> Dict[str, Any]:
-    """
-    Run environment diagnostic to verify functionality.
-    Useful for CI/CD and pre-training validation.
-    """
+    """Run comprehensive environment diagnostic"""
+    
     if cfg is None:
-        cfg = EnvConfig(mode="sim", seed=42)
+        cfg = EnvConfig(seed=42)
     
     results = {
-        "config": asdict(cfg),
-        "dependencies": {
-            "gym": _HAS_GYM,
-            "pandas": _HAS_PANDAS,
-            "redis": _HAS_REDIS,
-            "psutil": _HAS_PSUTIL,
-            "prometheus": _HAS_PROM
-        },
+        "config": {k: str(v) if isinstance(v, Enum) else v for k, v in asdict(cfg).items()},
         "tests": {}
     }
     
     try:
-        # Test environment creation
         env = make_env(cfg)
         results["tests"]["create_env"] = "✅ PASS"
         
-        # Test reset
         obs = env.reset(seed=42)
         results["tests"]["reset"] = f"✅ PASS (obs_shape={obs.shape})"
         
-        # Test step
-        action = np.array([1.0, 0.0, 0.0])
-        obs, reward, done, info = env.step(action)
-        results["tests"]["step"] = f"✅ PASS (reward={reward:.3f})"
-        
-        # Test multiple steps
-        for _ in range(10):
-            action = env.action_space.sample() if hasattr(env.action_space, 'sample') else np.zeros(3)
+        # Test episode
+        total_reward = 0.0
+        for step in range(100):
+            action = env.action_space.sample() if hasattr(env.action_space, 'sample') else np.random.randn(3)
             obs, reward, done, info = env.step(action)
+            total_reward += reward
+            
             if done:
-                obs = env.reset()
-        results["tests"]["multi_step"] = "✅ PASS"
+                break
         
-        # Test close
+        results["tests"]["episode"] = f"✅ PASS (steps={step+1}, reward={total_reward:.2f})"
+        
+        # Test scaling
+        obs = env.reset(seed=43)
+        obs, reward, done, info = env.step(np.array([10.0, 0.0, 0.0]))  # Scale up
+        results["tests"]["scale_up"] = f"✅ PASS (delta={info['exec']['applied_delta']})"
+        
+        obs, reward, done, info = env.step(np.array([-5.0, 0.0, 0.0]))  # Scale down
+        results["tests"]["scale_down"] = f"✅ PASS (delta={info['exec']['applied_delta']})"
+        
+        # Test throttling
+        obs, reward, done, info = env.step(np.array([0.0, 0.8, 0.0]))
+        results["tests"]["throttle"] = f"✅ PASS (throttle={info['exec']['throttle']})"
+        
         env.close()
         results["tests"]["close"] = "✅ PASS"
         
@@ -1263,16 +1411,18 @@ def run_env_diagnostic(cfg: Optional[EnvConfig] = None) -> Dict[str, Any]:
     
     return results
 
-# ---------------------------------------------------
-# CLI for diagnostics
-# ---------------------------------------------------
+# =============================================================================
+# CLI
+# =============================================================================
+
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="PriorityMax Real Environment - Diagnostics")
-    parser.add_argument("--mode", default="sim", choices=["sim", "live"], help="Environment mode")
+    parser = argparse.ArgumentParser(description="PriorityMax FAANG-Level Environment")
     parser.add_argument("--diagnostic", action="store_true", help="Run diagnostic tests")
-    parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--workload", default="ecommerce", choices=[w.value for w in WorkloadType])
+    parser.add_argument("--steps", type=int, default=100, help="Interactive test steps")
+    parser.add_argument("--verbose", action="store_true")
     
     args = parser.parse_args()
     
@@ -1280,43 +1430,52 @@ if __name__ == "__main__":
         LOG.setLevel(logging.DEBUG)
     
     if args.diagnostic:
-        print("\n" + "="*70)
-        print("PriorityMax Real Environment - Diagnostic Report")
-        print("="*70 + "\n")
+        print("\n" + "="*80)
+        print("PriorityMax FAANG-Level Environment - Diagnostic Report")
+        print("="*80 + "\n")
         
-        cfg = EnvConfig(mode=args.mode, seed=42)
+        cfg = EnvConfig(workload_type=args.workload, seed=42)
         results = run_env_diagnostic(cfg)
         
         print(json.dumps(results, indent=2))
-        print("\n" + "="*70)
+        print("\n" + "="*80)
         print(f"Status: {results['status']}")
-        print("="*70 + "\n")
+        print("="*80 + "\n")
         
         sys.exit(0 if results["status"].startswith("✅") else 1)
     
     else:
         # Interactive test
-        print("\n🎮 Interactive Environment Test\n")
+        print(f"\n🎮 Interactive FAANG Environment Test ({args.workload})\n")
         
-        cfg = EnvConfig(mode=args.mode, seed=42)
+        cfg = EnvConfig(workload_type=args.workload, seed=42)
         env = make_env(cfg)
         
         obs = env.reset()
-        print(f"Initial observation: {obs}")
+        print(f"Initial observation shape: {obs.shape}")
+        print(f"Observation space: {env.observation_space}")
+        print(f"Action space: {env.action_space}\n")
         
-        for step in range(5):
-            action = np.random.randn(3)  # Random action
+        for step in range(args.steps):
+            # Random policy
+            action = np.random.randn(3) * 5  # Scale actions
+            action[1] = np.clip(action[1], 0, 1)  # Throttle [0,1]
+            
             obs, reward, done, info = env.step(action)
             
-            print(f"\nStep {step + 1}:")
-            print(f"  Action: {action}")
-            print(f"  Reward: {reward:.3f}")
-            print(f"  Queue: {info['state']['queue_length']:.0f}")
-            print(f"  Workers: {info['state']['worker_count']:.0f}")
-            print(f"  Latency: {info['state']['avg_latency_ms']:.1f}ms")
+            if step % 20 == 0:
+                print(f"\n{'='*60}")
+                print(f"Step {step}:")
+                print(f"  Queue: {obs[0]:.0f} | Workers: {obs[1]:.0f} ({obs[10]:.1%} healthy)")
+                print(f"  Latency P95: {obs[3]:.1f}ms | Success: {obs[4]:.2%}")
+                print(f"  Arrival rate: {obs[5]:.1f}/s | Cost: ${obs[9]:.4f}/s")
+                print(f"  Reward: {reward:.2f} | SLA violations: {info['sla_violations']}")
+                print(f"  Action: Δworkers={action[0]:.1f}, throttle={action[1]:.2f}")
             
             if done:
-                print("  Episode terminated!")
+                print(f"\n❌ Episode terminated at step {step}")
+                print(f"   Total cost: ${info['total_cost']:.2f}")
+                print(f"   SLA violations: {info['sla_violations']}")
                 break
         
         env.close()
