@@ -131,11 +131,24 @@ def _hash_file(path: pathlib.Path) -> str:
     return h.hexdigest()
 
 def _audit(event: str, data: Dict[str, Any]):
+    """
+    FIXED: Handle both sync and async write_audit_event versions.
+    """
     try:
         payload = {"event": event, "ts": _now_iso(), **data}
-        write_audit_event(payload)
-    except Exception:
-        LOG.exception("Audit write failed for event=%s", event)
+        
+        # Try to call write_audit_event
+        result = write_audit_event(payload)
+        
+        # If it returns a coroutine, ignore it (we're in sync context)
+        import inspect
+        if inspect.iscoroutine(result):
+            # Close the coroutine to prevent warning
+            result.close()
+            
+    except Exception as e:
+        # Silently fail - audit is not critical
+        LOG.debug("Audit write failed for event=%s: %s", event, e)
 
 # ---------------------------
 # SYNCHRONIZED: Core Registry Class

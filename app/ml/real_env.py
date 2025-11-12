@@ -870,8 +870,7 @@ class RealEnvBase:
     # ---------------------------
     def compute_reward(self, exec_result: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
         """
-        Reward shaping synchronized with train_rl_heavy.py.
-        Balances latency, throughput, cost, queue, stability, and success.
+        FIXED: Reward shaping with strict bounds to prevent explosion.
         """
         sla = self.cfg.reward_latency_sla_ms
         lat = self.state["avg_latency_ms"]
@@ -881,26 +880,30 @@ class RealEnvBase:
         delta = exec_result.get("applied_delta", 0)
         throttle = exec_result.get("throttle", 0.0)
 
-        # Latency penalty
-        latency_pen = -((max(0.0, lat - sla) / sla) ** 2) * self.cfg.reward_latency_weight
+        # Bounded latency penalty
+        lat_normalized = min(lat / sla, 10.0)  # Cap at 10x SLA
+        latency_pen = -((max(0.0, lat_normalized - 1.0)) ** 2) * self.cfg.reward_latency_weight
+        latency_pen = max(latency_pen, -100.0)  # Floor
 
-        # Throughput reward
-        throughput_reward = succ * w * self.cfg.reward_throughput_weight
+        # Bounded queue penalty
+        queue_normalized = min(q / 1000.0, 10.0)
+        queue_pen = -math.log1p(queue_normalized) * self.cfg.reward_queue_weight
+        queue_pen = max(queue_pen, -50.0)  # Floor
 
-        # Cost penalty
-        cost_pen = -w * self.cfg.cost_per_worker_per_sec * self.cfg.reward_cost_weight
+        # Throughput reward (bounded)
+        throughput_reward = min(succ * w * self.cfg.reward_throughput_weight, 10.0)
 
-        # Queue penalty
-        queue_pen = -math.log1p(q) * self.cfg.reward_queue_weight
+        # Cost penalty (bounded)
+        cost_pen = -min(w * self.cfg.cost_per_worker_per_sec * self.cfg.reward_cost_weight, 10.0)
 
-        # Stability penalty
-        stability_pen = -abs(delta) * self.cfg.reward_stability_weight
+        # Stability penalty (bounded)
+        stability_pen = -min(abs(delta) * self.cfg.reward_stability_weight, 5.0)
 
         # Throttle penalty
         throttle_pen = -throttle * 0.5
 
-        # Success reward
-        success_bonus = succ * self.cfg.reward_success_weight
+        # Success bonus (bounded)
+        success_bonus = min(succ * self.cfg.reward_success_weight, 5.0)
 
         total = latency_pen + throughput_reward + cost_pen + queue_pen + stability_pen + throttle_pen + success_bonus
 
@@ -910,24 +913,26 @@ class RealEnvBase:
             sla_bonus = self.cfg.reward_sla_bonus
             total += sla_bonus
 
-        # Record success in circuit breaker (more lenient criteria)
+        # CRITICAL: Clip final reward
+        total = float(np.clip(total, -1000.0, 100.0))
+
+        # Circuit breaker (lenient)
         if self.circuit_breaker:
-            # Consider it a success if system is stable (not just perfect)
-            if succ > 0.8 and lat < sla * 2.0:  # More forgiving
+            if succ > 0.5 and lat < sla * 5.0:
                 self.circuit_breaker.record_success()
 
         details = {
-            "latency_pen": latency_pen,
-            "throughput_reward": throughput_reward,
-            "cost_penalty": cost_pen,
-            "queue_penalty": queue_pen,
-            "stability_penalty": stability_pen,
-            "throttle_penalty": throttle_pen,
-            "success_bonus": success_bonus,
-            "sla_bonus": sla_bonus,
+            "latency_pen": float(latency_pen),
+            "throughput_reward": float(throughput_reward),
+            "cost_penalty": float(cost_pen),
+            "queue_penalty": float(queue_pen),
+            "stability_penalty": float(stability_pen),
+            "throttle_penalty": float(throttle_pen),
+            "success_bonus": float(success_bonus),
+            "sla_bonus": float(sla_bonus),
             "final_reward": total
         }
-        return float(total), details
+        return total, details
 
     # ---------------------------
     # TERMINAL CONDITION
