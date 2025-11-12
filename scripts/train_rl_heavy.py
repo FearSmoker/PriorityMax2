@@ -589,7 +589,7 @@ class PPOTrainer:
         LOG.info("="*60)
     
     def _make_envs(self):
-        """Create vectorized environments"""
+        """Create vectorized environments (patched version with SimpleVecEnv wrapper)"""
         env_cfg = EnvConfig(
             mode="sim",
             obs_dim=self.cfg.obs_dim,
@@ -599,10 +599,58 @@ class PPOTrainer:
         )
         
         envs = make_vec_env(env_cfg, n=self.cfg.num_envs)
-        LOG.info(f"✅ Created {self.cfg.num_envs} vectorized environments")
-        
-        return envs
-    
+        LOG.info(f"✅ Created {self.cfg.num_envs} simulated environments")
+
+        # ---------------------------------------------------------------------
+        # Simple vectorized environment wrapper for training compatibility
+        # ---------------------------------------------------------------------
+        class SimpleVecEnv:
+            def __init__(self, envs):
+                self.envs = envs
+
+            def reset(self, seed=None):
+                """Reset all environments and return list of observations"""
+                obs_list = []
+                for i, env in enumerate(self.envs):
+                    s = (seed + i) if seed is not None else None
+                    obs_list.append(env.reset(seed=s))
+                return obs_list
+
+            def step(self, actions):
+                """
+                Step through all environments in parallel.
+                Each action in `actions` corresponds to one environment.
+                Returns: (obs_list, rewards, dones, infos)
+                """
+                obs_list, rewards, dones, infos = [], [], [], []
+                for env, action in zip(self.envs, actions):
+                    try:
+                        obs, r, d, info = env.step(action)
+                        if d:
+                            obs = env.reset()
+                        obs_list.append(obs)
+                        rewards.append(r)
+                        dones.append(d)
+                        infos.append(info)
+                    except Exception as e:
+                        LOG.warning(f"⚠️ Env step failed: {e}")
+                        obs_list.append(np.zeros(self.envs[0].cfg.obs_dim, dtype=np.float32))
+                        rewards.append(0.0)
+                        dones.append(True)
+                        infos.append({"error": str(e)})
+                return obs_list, np.array(rewards), np.array(dones), infos
+
+            def close(self):
+                """Close all environments cleanly"""
+                for env in self.envs:
+                    try:
+                        env.close()
+                    except Exception:
+                        pass
+
+        # Return wrapper for unified API
+        return SimpleVecEnv(envs)
+
     def _collect_rollout(self):
         """Collect trajectory data"""
         self.model.eval()
