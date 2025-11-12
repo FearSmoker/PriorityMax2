@@ -409,10 +409,10 @@ class RolloutBuffer:
         """Add transition"""
         self.observations[self.ptr] = torch.from_numpy(np.array(obs))
         self.actions[self.ptr] = torch.from_numpy(np.array(action))
-        self.rewards[self.ptr] = reward
-        self.values[self.ptr] = value
+        self.rewards[self.ptr] = float(reward)
+        self.values[self.ptr] = float(value)
         self.log_probs[self.ptr] = log_prob
-        self.dones[self.ptr] = done
+        self.dones[self.ptr] = bool(done)
         
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
