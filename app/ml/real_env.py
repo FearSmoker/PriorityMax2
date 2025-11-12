@@ -870,7 +870,7 @@ class RealEnvBase:
     # ---------------------------
     def compute_reward(self, exec_result: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
         """
-        FIXED: Reward shaping with strict bounds to prevent explosion.
+        FIXED: Reward shaping with STRICT bounds to prevent explosion.
         """
         sla = self.cfg.reward_latency_sla_ms
         lat = self.state["avg_latency_ms"]
@@ -880,15 +880,16 @@ class RealEnvBase:
         delta = exec_result.get("applied_delta", 0)
         throttle = exec_result.get("throttle", 0.0)
 
-        # Bounded latency penalty
+        # ===== BOUNDED PENALTIES =====
+        # Latency penalty (capped)
         lat_normalized = min(lat / sla, 10.0)  # Cap at 10x SLA
         latency_pen = -((max(0.0, lat_normalized - 1.0)) ** 2) * self.cfg.reward_latency_weight
-        latency_pen = max(latency_pen, -100.0)  # Floor
+        latency_pen = max(latency_pen, -100.0)  # Floor at -100
 
-        # Bounded queue penalty
-        queue_normalized = min(q / 1000.0, 10.0)
+        # Queue penalty (capped)
+        queue_normalized = min(q / 1000.0, 10.0)  # Normalize to 0-10
         queue_pen = -math.log1p(queue_normalized) * self.cfg.reward_queue_weight
-        queue_pen = max(queue_pen, -50.0)  # Floor
+        queue_pen = max(queue_pen, -50.0)  # Floor at -50
 
         # Throughput reward (bounded)
         throughput_reward = min(succ * w * self.cfg.reward_throughput_weight, 10.0)
@@ -899,12 +900,13 @@ class RealEnvBase:
         # Stability penalty (bounded)
         stability_pen = -min(abs(delta) * self.cfg.reward_stability_weight, 5.0)
 
-        # Throttle penalty
+        # Throttle penalty (bounded)
         throttle_pen = -throttle * 0.5
 
         # Success bonus (bounded)
         success_bonus = min(succ * self.cfg.reward_success_weight, 5.0)
 
+        # Sum components
         total = latency_pen + throughput_reward + cost_pen + queue_pen + stability_pen + throttle_pen + success_bonus
 
         # SLA bonus
@@ -913,8 +915,10 @@ class RealEnvBase:
             sla_bonus = self.cfg.reward_sla_bonus
             total += sla_bonus
 
-        # CRITICAL: Clip final reward
+        # ===== CRITICAL: CLIP FINAL REWARD =====
+        # THIS LINE IS THE KEY FIX - ADD IT BEFORE RETURN!
         total = float(np.clip(total, -1000.0, 100.0))
+        # ========================================
 
         # Circuit breaker (lenient)
         if self.circuit_breaker:
@@ -933,7 +937,7 @@ class RealEnvBase:
             "final_reward": total
         }
         return total, details
-
+    
     # ---------------------------
     # TERMINAL CONDITION
     # ---------------------------
