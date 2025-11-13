@@ -186,7 +186,7 @@ class EnvConfig:
     workload_type: str = "ecommerce"
     base_arrival_rate: float = 10.0
     peak_arrival_multiplier: float = 5.0          # Reduced from 8.0
-    flash_crowd_probability: float = 0.001         # Reduced from 0.03
+    flash_crowd_probability: float = 0.0001         # Reduced from 0.03
     flash_crowd_duration_steps: int = 15          # Reduced from 30
     flash_crowd_multiplier: float = 2.0          # Reduced from 15.0
     
