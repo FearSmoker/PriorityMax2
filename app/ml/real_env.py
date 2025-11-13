@@ -186,9 +186,9 @@ class EnvConfig:
     workload_type: str = "ecommerce"
     base_arrival_rate: float = 10.0
     peak_arrival_multiplier: float = 5.0          # Reduced from 8.0
-    flash_crowd_probability: float = 0.005         # Reduced from 0.03
+    flash_crowd_probability: float = 0.001         # Reduced from 0.03
     flash_crowd_duration_steps: int = 15          # Reduced from 30
-    flash_crowd_multiplier: float = 5.0          # Reduced from 15.0
+    flash_crowd_multiplier: float = 2.0          # Reduced from 15.0
     
     # Diurnal patterns
     diurnal_amplitude: float = 0.6                # Reduced from 0.8
@@ -215,9 +215,9 @@ class EnvConfig:
     worker_capacity_per_sec: float = 10.0
     
     # Failures (TUNED FOR STABILITY)
-    base_failure_rate: float = 0.002              # Reduced from 0.005
+    base_failure_rate: float = 0.0005              # Reduced from 0.005
     overload_failure_multiplier: float = 2.0      # Reduced from 3.0
-    cascade_failure_probability: float = 0.002    # Reduced from 0.01
+    cascade_failure_probability: float = 0.001    # Reduced from 0.01
     byzantine_failure_rate: float = 0.0005        # Reduced from 0.001
     network_partition_probability: float = 0.002  # Reduced from 0.005
     
