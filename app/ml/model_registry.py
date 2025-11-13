@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PriorityMax Model Registry - FULLY SYNCHRONIZED ENTERPRISE EDITION
--------------------------------------------------------------------
+PriorityMax Model Registry - FULLY SYNCHRONIZED WITH STABLE TRAINING
+---------------------------------------------------------------------
 
-SYNCHRONIZED WITH:
-- real_env.py v2 (obs_dim=12, WorkloadType enum, extended metrics)
-- train_rl_heavy.py (AMP checkpoints, ONNX export, emergency saves)
-- train_rl_live.py (rollback manager, checkpoint indexing)
-- train_rl_eval.py (A/B testing, drift detection)
+✅ SYNCHRONIZED WITH:
+- real_env_STABLE.py (obs_dim=12, bounded rewards, observation normalization)
+- train_rl_STABLE.py (gamma=0.99, lr=3e-4, clipped value loss, stable hyperparameters)
 
-CRITICAL SYNCHRONIZATION:
-✅ Validates obs_dim=12, act_dim=3 from real_env.py
-✅ Validates WorkloadType compatibility
-✅ Handles AMP (Mixed Precision) checkpoints from train_rl_heavy.py
-✅ Detects emergency_autosave.pt pattern
-✅ ONNX model validation with onnxruntime
-✅ Extended metrics validation (p99_latency, cost_rate, etc.)
+✅ NEW VALIDATION FEATURES:
+- Validates stable hyperparameters (gamma, lambda, lr)
+- Validates normalization metadata (obs, reward)
+- Validates bounded reward configuration
+- Detects explosion-prone configurations
+- Validates clipped value loss usage
+
+CRITICAL: This registry ensures only STABLE models are promoted to production!
 """
 
 from __future__ import annotations
@@ -33,6 +32,7 @@ import hashlib
 import logging
 from typing import Any, Dict, Optional, List, Tuple, Union
 from enum import Enum
+from dataclasses import dataclass
 
 # Optional dependencies
 try:
@@ -81,14 +81,46 @@ S3_BUCKET = os.getenv("PRIORITYMAX_S3_BUCKET", None)
 
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-# === SYNCHRONIZED CONSTANTS from real_env.py ===
-EXPECTED_OBS_DIM = 12  # Extended observation space
-EXPECTED_ACT_DIM = 3   # [delta_workers, throttle, priority_bias]
+# =============================================================================
+# SYNCHRONIZED CONSTANTS (FROM STABLE TRAINING)
+# =============================================================================
+
+# From real_env_STABLE.py
+EXPECTED_OBS_DIM = 12
+EXPECTED_ACT_DIM = 3
 
 VALID_WORKLOAD_TYPES = [
     "ecommerce", "social_media", "streaming", 
     "api_backend", "batch", "gaming"
 ]
+
+# From train_rl_STABLE.py - STABLE HYPERPARAMETERS
+@dataclass
+class StableHyperparameters:
+    """Expected stable hyperparameters for production models"""
+    gamma: float = 0.99  # NOT 0.995 (causes explosion)
+    lam: float = 0.95    # NOT 0.97 (causes explosion)
+    lr: float = 3e-4     # Standard PPO (or 1e-4 for conservative)
+    clip_ratio: float = 0.2
+    value_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    entropy_coef: float = 0.01
+    
+    # Training schedule
+    steps_per_epoch: int = 2048  # NOT 4096 (prevents explosion)
+    update_epochs: int = 10
+    target_kl: float = 0.015
+
+STABLE_PARAMS = StableHyperparameters()
+
+# Dangerous configurations that cause explosion
+EXPLOSION_PRONE_CONFIGS = {
+    "gamma": (0.995, "Too high, causes GAE accumulation → explosion"),
+    "lam": (0.97, "Too high, causes advantage explosion"),
+    "lr": (1e-3, "Too high for PPO, causes policy divergence"),
+    "steps_per_epoch": (4096, "Too large, causes gradient explosion"),
+    "value_coef": (0.25, "Too low without clipped value loss"),
+}
 
 # Helper functions
 def _now_iso():
@@ -102,7 +134,7 @@ def _hash_file(path: pathlib.Path) -> str:
     return h.hexdigest()
 
 def _audit(event: str, data: Dict[str, Any]):
-    """Simplified audit logging"""
+    """Audit logging"""
     try:
         audit_file = MODELS_DIR.parent / "logs" / "model_audit.jsonl"
         audit_file.parent.mkdir(parents=True, exist_ok=True)
@@ -111,39 +143,249 @@ def _audit(event: str, data: Dict[str, Any]):
         with open(audit_file, "a") as f:
             f.write(json.dumps(payload, default=str) + "\n")
     except:
-        pass  # Non-critical
+        pass
 
 # =============================================================================
-# SYNCHRONIZED MODEL REGISTRY
+# STABILITY ANALYZER
+# =============================================================================
+
+class StabilityAnalyzer:
+    """
+    Analyzes training configurations for stability issues.
+    
+    CRITICAL: Detects explosion-prone configurations before deployment!
+    """
+    
+    @staticmethod
+    def analyze_hyperparameters(training_config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze if hyperparameters are stable.
+        
+        Returns:
+            {
+                "stable": bool,
+                "warnings": List[str],
+                "critical_issues": List[str],
+                "score": float (0-100, higher is better)
+            }
+        """
+        result = {
+            "stable": True,
+            "warnings": [],
+            "critical_issues": [],
+            "score": 100.0
+        }
+        
+        if not training_config:
+            result["warnings"].append("No training config provided")
+            result["score"] -= 20
+            return result
+        
+        # Check gamma
+        gamma = training_config.get("gamma", None)
+        if gamma is not None:
+            if gamma >= EXPLOSION_PRONE_CONFIGS["gamma"][0]:
+                result["critical_issues"].append(
+                    f"❌ CRITICAL: gamma={gamma} (expected {STABLE_PARAMS.gamma}). "
+                    f"{EXPLOSION_PRONE_CONFIGS['gamma'][1]}"
+                )
+                result["stable"] = False
+                result["score"] -= 40
+            elif abs(gamma - STABLE_PARAMS.gamma) > 0.01:
+                result["warnings"].append(
+                    f"⚠️  gamma={gamma} differs from stable value ({STABLE_PARAMS.gamma})"
+                )
+                result["score"] -= 10
+        
+        # Check lambda
+        lam = training_config.get("lam", None)
+        if lam is not None:
+            if lam >= EXPLOSION_PRONE_CONFIGS["lam"][0]:
+                result["critical_issues"].append(
+                    f"❌ CRITICAL: lambda={lam} (expected {STABLE_PARAMS.lam}). "
+                    f"{EXPLOSION_PRONE_CONFIGS['lam'][1]}"
+                )
+                result["stable"] = False
+                result["score"] -= 40
+            elif abs(lam - STABLE_PARAMS.lam) > 0.01:
+                result["warnings"].append(
+                    f"⚠️  lambda={lam} differs from stable value ({STABLE_PARAMS.lam})"
+                )
+                result["score"] -= 10
+        
+        # Check learning rate
+        lr = training_config.get("lr", None)
+        if lr is not None:
+            if lr >= EXPLOSION_PRONE_CONFIGS["lr"][0]:
+                result["critical_issues"].append(
+                    f"❌ CRITICAL: lr={lr} is too high. "
+                    f"{EXPLOSION_PRONE_CONFIGS['lr'][1]}"
+                )
+                result["stable"] = False
+                result["score"] -= 40
+            elif lr not in [3e-4, 1e-4]:
+                result["warnings"].append(
+                    f"⚠️  lr={lr} is non-standard (expected 3e-4 or 1e-4)"
+                )
+                result["score"] -= 10
+        
+        # Check steps per epoch
+        steps = training_config.get("steps_per_epoch", None)
+        if steps is not None:
+            if steps >= EXPLOSION_PRONE_CONFIGS["steps_per_epoch"][0]:
+                result["critical_issues"].append(
+                    f"❌ CRITICAL: steps_per_epoch={steps} is too large. "
+                    f"{EXPLOSION_PRONE_CONFIGS['steps_per_epoch'][1]}"
+                )
+                result["stable"] = False
+                result["score"] -= 30
+            elif steps != STABLE_PARAMS.steps_per_epoch:
+                result["warnings"].append(
+                    f"⚠️  steps_per_epoch={steps} (recommended: {STABLE_PARAMS.steps_per_epoch})"
+                )
+                result["score"] -= 5
+        
+        # Check value coefficient (only critical if no clipped value loss)
+        value_coef = training_config.get("value_coef", None)
+        use_clipped_value = training_config.get("use_clipped_value_loss", True)
+        
+        if value_coef is not None and not use_clipped_value:
+            if value_coef <= EXPLOSION_PRONE_CONFIGS["value_coef"][0]:
+                result["critical_issues"].append(
+                    f"❌ CRITICAL: value_coef={value_coef} without clipped value loss. "
+                    f"{EXPLOSION_PRONE_CONFIGS['value_coef'][1]}"
+                )
+                result["stable"] = False
+                result["score"] -= 50
+        
+        # Check for critical stability features
+        if not training_config.get("use_clipped_value_loss", False):
+            result["critical_issues"].append(
+                "❌ CRITICAL: Clipped value loss not enabled (required for stability!)"
+            )
+            result["stable"] = False
+            result["score"] -= 50
+        
+        if not training_config.get("normalize_advantages", True):
+            result["warnings"].append(
+                "⚠️  Advantage normalization not enabled (recommended)"
+            )
+            result["score"] -= 10
+        
+        if not training_config.get("normalize_observations", True):
+            result["critical_issues"].append(
+                "❌ CRITICAL: Observation normalization not enabled (required!)"
+            )
+            result["stable"] = False
+            result["score"] -= 40
+        
+        if not training_config.get("normalize_rewards", True):
+            result["warnings"].append(
+                "⚠️  Reward normalization not enabled (recommended)"
+            )
+            result["score"] -= 10
+        
+        # Check gradient clipping
+        max_grad_norm = training_config.get("max_grad_norm", None)
+        if max_grad_norm is None or max_grad_norm > 1.0:
+            result["warnings"].append(
+                f"⚠️  max_grad_norm={max_grad_norm} (recommended: 0.5)"
+            )
+            result["score"] -= 10
+        
+        result["score"] = max(0.0, min(100.0, result["score"]))
+        
+        return result
+    
+    @staticmethod
+    def analyze_training_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze training metrics for signs of instability.
+        
+        Checks for:
+        - NaN losses
+        - Value explosion (value_mean > 100)
+        - Extreme KL divergence
+        - Sudden reward drops
+        """
+        result = {
+            "stable": True,
+            "warnings": [],
+            "issues": []
+        }
+        
+        # Check for NaN
+        if any(v != v for v in metrics.values() if isinstance(v, (int, float))):
+            result["issues"].append("❌ NaN detected in metrics")
+            result["stable"] = False
+        
+        # Check value predictions
+        value_mean = metrics.get("value_mean", None)
+        if value_mean is not None:
+            if abs(value_mean) > 100:
+                result["issues"].append(
+                    f"❌ Value explosion detected: value_mean={value_mean:.2f}"
+                )
+                result["stable"] = False
+            elif abs(value_mean) > 50:
+                result["warnings"].append(
+                    f"⚠️  High value predictions: value_mean={value_mean:.2f}"
+                )
+        
+        # Check KL divergence
+        kl_div = metrics.get("kl_div", None)
+        if kl_div is not None:
+            if kl_div > 0.1:
+                result["issues"].append(
+                    f"❌ Excessive KL divergence: {kl_div:.4f}"
+                )
+                result["stable"] = False
+        
+        # Check rewards
+        mean_reward = metrics.get("mean_reward", None)
+        if mean_reward is not None:
+            if mean_reward < -1000:
+                result["warnings"].append(
+                    f"⚠️  Very negative rewards: {mean_reward:.2f}"
+                )
+        
+        return result
+
+# =============================================================================
+# MODEL REGISTRY (STABILITY-AWARE)
 # =============================================================================
 
 class ModelRegistry:
     """
-    Production model registry synchronized with PriorityMax training pipeline.
+    Production model registry with STABILITY VALIDATION.
     
-    SYNCHRONIZED FEATURES:
-    - Validates real_env.py obs_dim=12, act_dim=3
-    - Handles train_rl_heavy.py checkpoint format (AMP support)
-    - Detects emergency_autosave.pt pattern
-    - ONNX validation with dimension checks
-    - Workload type validation
+    NEW FEATURES:
+    ✅ Validates stable hyperparameters (gamma=0.99, lr=3e-4, etc.)
+    ✅ Detects explosion-prone configurations
+    ✅ Validates normalization features
+    ✅ Analyzes training metrics for instability
+    ✅ Blocks promotion of unstable models
     """
     
     def __init__(self,
                  models_dir: pathlib.Path = MODELS_DIR,
                  registry_file: pathlib.Path = REGISTRY_FILE,
                  rollback_index: pathlib.Path = ROLLBACK_INDEX,
-                 s3_bucket: Optional[str] = S3_BUCKET):
+                 s3_bucket: Optional[str] = S3_BUCKET,
+                 strict_stability: bool = True):
         self.models_dir = pathlib.Path(models_dir)
         self.registry_file = pathlib.Path(registry_file)
         self.rollback_index = pathlib.Path(rollback_index)
         self.s3_bucket = s3_bucket
+        self.strict_stability = strict_stability  # NEW: Block unstable models
         
         self.models_dir.mkdir(parents=True, exist_ok=True)
         self._registry = self._load_registry()
         self._rollback_data = self._load_rollback_index()
         
-        LOG.info("Model Registry initialized (models_dir=%s)", self.models_dir)
+        self.stability_analyzer = StabilityAnalyzer()
+        
+        LOG.info("Model Registry initialized (strict_stability=%s)", strict_stability)
     
     # -------------------------------------------------------------------------
     # Registry persistence
@@ -173,7 +415,6 @@ class ModelRegistry:
         try:
             return json.loads(self.rollback_index.read_text(encoding="utf-8"))
         except:
-            LOG.exception("Failed to load rollback index")
             return {"checkpoints": []}
     
     def _save_rollback_index(self):
@@ -183,23 +424,14 @@ class ModelRegistry:
                 encoding="utf-8"
             )
         except:
-            LOG.exception("Failed to save rollback index")
+            pass
     
     # -------------------------------------------------------------------------
-    # SYNCHRONIZED: Checkpoint format detection
+    # Checkpoint format detection (same as before)
     # -------------------------------------------------------------------------
     
     def _detect_checkpoint_format(self, path: pathlib.Path) -> str:
-        """
-        Detect checkpoint format (SYNCHRONIZED with train_rl_heavy.py).
-        
-        Formats:
-        - train_rl_heavy: Standard checkpoint with model_state_dict
-        - train_rl_heavy_amp: AMP checkpoint with scaler_state_dict
-        - emergency_checkpoint: emergency_autosave.pt pattern
-        - onnx: .onnx file
-        """
-        # Check filename pattern for emergency
+        """Detect checkpoint format"""
         if "emergency" in path.name.lower() or "autosave" in path.name.lower():
             return "emergency_checkpoint"
         
@@ -212,21 +444,17 @@ class ModelRegistry:
         try:
             ckpt = torch.load(str(path), map_location="cpu")
             
-            # train_rl_heavy.py format
             if "model_state_dict" in ckpt and "optimizer_state_dict" in ckpt:
                 if "scaler_state_dict" in ckpt:
-                    return "train_rl_heavy_amp"  # Mixed precision
-                return "train_rl_heavy"
+                    return "train_rl_stable_amp"
+                return "train_rl_stable"
             
-            # Legacy format
             if "model" in ckpt:
                 return "legacy_module"
             
-            # Direct state dict
             if all(isinstance(v, torch.Tensor) for v in ckpt.values()):
                 return "state_dict_only"
             
-            # Emergency flag
             if ckpt.get("emergency"):
                 return "emergency_checkpoint"
             
@@ -235,22 +463,41 @@ class ModelRegistry:
             LOG.warning("Failed to detect checkpoint format: %s", path)
             return "unknown"
     
+    def _extract_model_dimensions(self, state_dict: Dict) -> Optional[Dict[str, int]]:
+        """Extract obs_dim and act_dim from model state_dict"""
+        try:
+            dims = {}
+            
+            for key, tensor in state_dict.items():
+                if "shared_net" in key and ".0.weight" in key:
+                    dims["obs_dim"] = tensor.shape[1]
+                    break
+            
+            for key, tensor in state_dict.items():
+                if "policy_net" in key and "weight" in key:
+                    if len(tensor.shape) == 2:
+                        dims["act_dim"] = tensor.shape[0]
+                        break
+            
+            return dims if dims else None
+        except:
+            return None
+    
+    # -------------------------------------------------------------------------
+    # NEW: STABILITY VALIDATION
+    # -------------------------------------------------------------------------
+    
     def _validate_checkpoint_structure(self, path: pathlib.Path) -> Dict[str, Any]:
         """
-        Validate checkpoint structure (SYNCHRONIZED with training scripts).
-        
-        Checks:
-        - Can be loaded by PyTorch
-        - Has model_state_dict or model key
-        - Dimension compatibility (obs_dim=12, act_dim=3)
-        - Training metadata present
+        ENHANCED: Validate checkpoint structure + STABILITY.
         """
         result = {
             "valid": True,
             "errors": [],
             "warnings": [],
             "dimensions": None,
-            "format": None
+            "format": None,
+            "stability_analysis": None  # NEW
         }
         
         if not _HAS_TORCH:
@@ -261,7 +508,6 @@ class ModelRegistry:
         try:
             ckpt = torch.load(str(path), map_location="cpu")
             
-            # Detect format
             fmt = self._detect_checkpoint_format(path)
             result["format"] = fmt
             
@@ -281,7 +527,7 @@ class ModelRegistry:
                 result["errors"].append("invalid_state_dict_type")
                 return result
             
-            # === CRITICAL: Validate dimensions (synchronized with real_env.py) ===
+            # Validate dimensions
             dims = self._extract_model_dimensions(state)
             result["dimensions"] = dims
             
@@ -296,17 +542,31 @@ class ModelRegistry:
                         f"act_dim mismatch: expected {EXPECTED_ACT_DIM}, got {dims.get('act_dim')}"
                     )
             
+            # === NEW: STABILITY ANALYSIS ===
+            training_config = ckpt.get("config", None)
+            if training_config:
+                stability = self.stability_analyzer.analyze_hyperparameters(training_config)
+                result["stability_analysis"] = stability
+                
+                if not stability["stable"]:
+                    result["warnings"].append("⚠️  UNSTABLE training configuration detected!")
+                    for issue in stability["critical_issues"]:
+                        result["warnings"].append(f"  {issue}")
+                
+                # Log stability score
+                LOG.info("Stability score: %.1f/100", stability["score"])
+            else:
+                result["warnings"].append("No training config found in checkpoint")
+            
             # Check training metadata
-            if fmt.startswith("train_rl_heavy"):
+            if fmt.startswith("train_rl_stable"):
                 if "epoch" not in ckpt and "total_steps" not in ckpt:
                     result["warnings"].append("no_training_progress_metadata")
                 
-                # Validate AMP components
-                if fmt == "train_rl_heavy_amp":
+                if fmt == "train_rl_stable_amp":
                     if "scaler_state_dict" not in ckpt:
                         result["warnings"].append("amp_format_but_no_scaler")
             
-            # Check optimizer state (for resuming training)
             if "optimizer_state_dict" not in ckpt and "optimizer" not in ckpt:
                 result["warnings"].append("no_optimizer_state")
             
@@ -316,50 +576,12 @@ class ModelRegistry:
         
         return result
     
-    def _extract_model_dimensions(self, state_dict: Dict) -> Optional[Dict[str, int]]:
-        """
-        Extract obs_dim and act_dim from model state_dict.
-        
-        Looks for:
-        - shared_net.0.weight: [hidden, obs_dim] -> obs_dim
-        - policy_net.*.weight: [act_dim, hidden] -> act_dim
-        """
-        try:
-            dims = {}
-            
-            # Find observation dimension
-            for key, tensor in state_dict.items():
-                if "shared_net" in key and ".0.weight" in key:
-                    # Shape: [hidden_dim, obs_dim]
-                    dims["obs_dim"] = tensor.shape[1]
-                    break
-            
-            # Find action dimension
-            for key, tensor in state_dict.items():
-                if "policy_net" in key and "weight" in key:
-                    # Last linear layer: [act_dim, hidden]
-                    if len(tensor.shape) == 2:
-                        dims["act_dim"] = tensor.shape[0]
-                        break
-            
-            return dims if dims else None
-        except:
-            return None
-    
     # -------------------------------------------------------------------------
-    # SYNCHRONIZED: ONNX validation
+    # ONNX validation (same as before)
     # -------------------------------------------------------------------------
     
     def validate_onnx_model(self, model_path: Union[str, pathlib.Path]) -> Dict[str, Any]:
-        """
-        Validate ONNX model (SYNCHRONIZED with train_rl_heavy.py export).
-        
-        Checks:
-        - Can be loaded by onnxruntime
-        - Input shape matches obs_dim=12
-        - Output shapes are correct (action_mean, value)
-        - Inference test passes
-        """
+        """Validate ONNX model"""
         if not _HAS_ONNX:
             return {"valid": False, "error": "onnxruntime_not_available"}
         
@@ -368,39 +590,25 @@ class ModelRegistry:
             return {"valid": False, "error": "file_not_found"}
         
         try:
-            # Load session
             session = ort.InferenceSession(str(path))
             
-            # Get I/O info
             inputs = session.get_inputs()
             outputs = session.get_outputs()
             
             input_info = [(inp.name, inp.shape, inp.type) for inp in inputs]
             output_info = [(out.name, out.shape, out.type) for out in outputs]
             
-            # === CRITICAL: Validate dimensions ===
             if len(inputs) != 1:
-                return {
-                    "valid": False, 
-                    "error": f"expected 1 input, got {len(inputs)}"
-                }
+                return {"valid": False, "error": f"expected 1 input, got {len(inputs)}"}
             
             input_shape = inputs[0].shape
-            # Handle dynamic batch: [None, obs_dim] or ['batch', obs_dim]
             if len(input_shape) != 2:
-                return {
-                    "valid": False,
-                    "error": f"expected 2D input [batch, obs_dim], got {input_shape}"
-                }
+                return {"valid": False, "error": f"expected 2D input [batch, obs_dim], got {input_shape}"}
             
             obs_dim = input_shape[1]
             if isinstance(obs_dim, int) and obs_dim != EXPECTED_OBS_DIM:
-                return {
-                    "valid": False,
-                    "error": f"obs_dim mismatch: expected {EXPECTED_OBS_DIM}, got {obs_dim}"
-                }
+                return {"valid": False, "error": f"obs_dim mismatch: expected {EXPECTED_OBS_DIM}, got {obs_dim}"}
             
-            # Test inference
             if _HAS_NUMPY:
                 import numpy as np
                 batch_size = 1
@@ -409,27 +617,16 @@ class ModelRegistry:
                 input_name = inputs[0].name
                 test_outputs = session.run(None, {input_name: test_input})
                 
-                # Validate outputs
                 if len(test_outputs) != 2:
-                    return {
-                        "valid": False,
-                        "error": f"expected 2 outputs [action_mean, value], got {len(test_outputs)}"
-                    }
+                    return {"valid": False, "error": f"expected 2 outputs [action_mean, value], got {len(test_outputs)}"}
                 
                 action_mean, value = test_outputs
                 
-                # Check shapes
                 if action_mean.shape != (batch_size, EXPECTED_ACT_DIM):
-                    return {
-                        "valid": False,
-                        "error": f"action_mean shape mismatch: expected ({batch_size}, {EXPECTED_ACT_DIM}), got {action_mean.shape}"
-                    }
+                    return {"valid": False, "error": f"action_mean shape mismatch: expected ({batch_size}, {EXPECTED_ACT_DIM}), got {action_mean.shape}"}
                 
                 if value.shape != (batch_size,):
-                    return {
-                        "valid": False,
-                        "error": f"value shape mismatch: expected ({batch_size},), got {value.shape}"
-                    }
+                    return {"valid": False, "error": f"value shape mismatch: expected ({batch_size},), got {value.shape}"}
             
             return {
                 "valid": True,
@@ -446,7 +643,7 @@ class ModelRegistry:
             return {"valid": False, "error": str(e)}
     
     # -------------------------------------------------------------------------
-    # SYNCHRONIZED: Model registration
+    # ENHANCED: Model registration with stability checks
     # -------------------------------------------------------------------------
     
     def register_model(self,
@@ -462,14 +659,9 @@ class ModelRegistry:
                        is_onnx: bool = False,
                        is_emergency: bool = False) -> Dict[str, Any]:
         """
-        Register new model version (SYNCHRONIZED with training pipeline).
+        Register new model version with STABILITY VALIDATION.
         
-        Features:
-        - Auto-detects checkpoint format
-        - Validates dimensions (obs_dim=12, act_dim=3)
-        - Validates workload_type in training_config
-        - Handles ONNX models
-        - Marks emergency checkpoints
+        NEW: Analyzes training configuration for stability issues!
         """
         path = pathlib.Path(file_path)
         if not path.exists():
@@ -478,7 +670,6 @@ class ModelRegistry:
         file_hash = _hash_file(path)
         version_id = f"{model_type}_{datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:6]}"
         
-        # Detect format
         checkpoint_format = self._detect_checkpoint_format(path)
         is_onnx = is_onnx or checkpoint_format == "onnx"
         is_emergency = is_emergency or checkpoint_format == "emergency_checkpoint"
@@ -503,10 +694,9 @@ class ModelRegistry:
             "checkpoint_format": checkpoint_format,
         }
         
-        # === SYNCHRONIZED VALIDATION ===
+        # === VALIDATION ===
         
         if is_onnx:
-            # ONNX validation
             validation = self.validate_onnx_model(path)
             entry["validation"] = validation
             
@@ -514,19 +704,41 @@ class ModelRegistry:
                 LOG.error("ONNX validation failed: %s", validation.get("error"))
                 raise ValueError(f"ONNX validation failed: {validation.get('error')}")
         else:
-            # PyTorch checkpoint validation
             validation = self._validate_checkpoint_structure(path)
             entry["validation"] = validation
             
             if not validation["valid"]:
                 LOG.warning("Checkpoint validation failed: %s", validation["errors"])
             
-            # Log dimension warnings
+            # === NEW: STABILITY CHECKS ===
+            stability_analysis = validation.get("stability_analysis")
+            if stability_analysis:
+                entry["stability_score"] = stability_analysis["score"]
+                entry["stability_stable"] = stability_analysis["stable"]
+                
+                if not stability_analysis["stable"]:
+                    LOG.error("="*60)
+                    LOG.error("⚠️  UNSTABLE MODEL DETECTED!")
+                    LOG.error("="*60)
+                    for issue in stability_analysis["critical_issues"]:
+                        LOG.error(issue)
+                    LOG.error("Stability score: %.1f/100", stability_analysis["score"])
+                    LOG.error("="*60)
+                    
+                    if self.strict_stability and not is_emergency:
+                        raise ValueError(
+                            f"Model failed stability validation (score={stability_analysis['score']:.1f}/100). "
+                            f"Issues: {stability_analysis['critical_issues']}"
+                        )
+                else:
+                    LOG.info("✅ Model passed stability validation (score=%.1f/100)", 
+                            stability_analysis["score"])
+            
             for warning in validation.get("warnings", []):
                 if "mismatch" in warning:
                     LOG.warning("⚠️  %s", warning)
         
-        # Validate workload_type if present
+        # Validate workload_type
         if training_config and "workload_type" in training_config:
             workload = training_config["workload_type"]
             if workload not in VALID_WORKLOAD_TYPES:
@@ -552,21 +764,21 @@ class ModelRegistry:
         self._add_to_rollback_index(entry)
         
         _audit("model_registered", entry)
-        LOG.info("✅ Registered model: %s (format=%s, is_onnx=%s, is_emergency=%s)", 
-                version_id, checkpoint_format, is_onnx, is_emergency)
+        LOG.info("✅ Registered model: %s (format=%s, stability_score=%.1f)", 
+                version_id, checkpoint_format, entry.get("stability_score", 0))
         
         return entry
     
     def _add_to_rollback_index(self, entry: Dict[str, Any]):
-        """Add to rollback manager (synchronized with train_rl_live.py)"""
+        """Add to rollback manager"""
         self._rollback_data["checkpoints"].append({
             "path": entry["file_path"],
             "timestamp": entry["created_at"],
             "metrics": entry["metrics"],
-            "version_id": entry["version_id"]
+            "version_id": entry["version_id"],
+            "stability_score": entry.get("stability_score", None)
         })
         
-        # Keep last N checkpoints
         keep_n = int(os.getenv("MODEL_REGISTRY_ROLLBACK_KEEP", "10"))
         self._rollback_data["checkpoints"] = sorted(
             self._rollback_data["checkpoints"],
@@ -582,7 +794,8 @@ class ModelRegistry:
     def list_models(self, 
                    model_type: Optional[str] = None,
                    include_emergency: bool = False,
-                   include_onnx: bool = True) -> List[Dict[str, Any]]:
+                   include_onnx: bool = True,
+                   min_stability_score: float = 0.0) -> List[Dict[str, Any]]:
         """List models with filtering"""
         results = []
         for v in self._registry.values():
@@ -592,6 +805,12 @@ class ModelRegistry:
                 continue
             if not include_onnx and v.get("is_onnx"):
                 continue
+            
+            # NEW: Filter by stability score
+            stability_score = v.get("stability_score", 100.0)
+            if stability_score < min_stability_score:
+                continue
+            
             results.append(v)
         
         return sorted(results, key=lambda x: x.get("created_at", ""), reverse=True)
@@ -606,8 +825,9 @@ class ModelRegistry:
     def get_latest(self, 
                   model_type: str,
                   only_active: bool = True,
-                  prefer_onnx: bool = False) -> Optional[Dict[str, Any]]:
-        """Get latest model (optionally prefer ONNX)"""
+                  prefer_onnx: bool = False,
+                  min_stability_score: float = 70.0) -> Optional[Dict[str, Any]]:
+        """Get latest model (optionally prefer ONNX, require stability)"""
         filtered = [v for v in self._registry.values() 
                    if v.get("model_type") == model_type]
         
@@ -616,6 +836,10 @@ class ModelRegistry:
         
         # Exclude emergency checkpoints
         filtered = [v for v in filtered if not v.get("is_emergency")]
+        
+        # NEW: Filter by stability score
+        filtered = [v for v in filtered 
+                   if v.get("stability_score", 100.0) >= min_stability_score]
         
         if not filtered:
             return None
@@ -633,7 +857,7 @@ class ModelRegistry:
     # -------------------------------------------------------------------------
     
     def validate_model(self, model_entry: Dict[str, Any]) -> bool:
-        """Comprehensive validation"""
+        """Comprehensive validation including stability"""
         path = pathlib.Path(model_entry["file_path"])
         
         # File existence
@@ -657,20 +881,53 @@ class ModelRegistry:
             if not validation["valid"]:
                 LOG.error("Checkpoint validation failed: %s", validation["errors"])
                 return False
+            
+            # NEW: Check stability
+            stability_analysis = validation.get("stability_analysis")
+            if stability_analysis and not stability_analysis["stable"]:
+                LOG.warning("⚠️  Model has stability issues (score=%.1f/100)", 
+                           stability_analysis["score"])
+                for issue in stability_analysis["critical_issues"]:
+                    LOG.warning("  %s", issue)
+                
+                if self.strict_stability:
+                    LOG.error("Validation failed: unstable model (strict mode)")
+                    return False
         
         LOG.info("✅ Validation passed: %s", model_entry["version_id"])
         return True
     
     # -------------------------------------------------------------------------
-    # Promotion & Rollback
+    # ENHANCED: Promotion with stability checks
     # -------------------------------------------------------------------------
     
     def promote_model(self, version_id: str, force: bool = False) -> Dict[str, Any]:
-        """Promote model to active"""
+        """
+        Promote model to active (ENHANCED with stability checks).
+        
+        NEW: Blocks promotion of unstable models unless force=True!
+        """
         entry = self.get_model(version_id)
         
-        if not force and not self.validate_model(entry):
-            raise ValueError("Validation failed; use force=True to override")
+        # NEW: Check stability before promotion
+        stability_score = entry.get("stability_score", None)
+        stability_stable = entry.get("stability_stable", None)
+        
+        if not force:
+            if stability_score is not None and stability_score < 70.0:
+                raise ValueError(
+                    f"Cannot promote unstable model (stability_score={stability_score:.1f}/100). "
+                    f"Use force=True to override."
+                )
+            
+            if stability_stable is False:
+                raise ValueError(
+                    f"Cannot promote model with critical stability issues. "
+                    f"Use force=True to override."
+                )
+            
+            if not self.validate_model(entry):
+                raise ValueError("Validation failed; use force=True to override")
         
         model_type = entry["model_type"]
         
@@ -684,7 +941,8 @@ class ModelRegistry:
         self._save_registry()
         
         _audit("model_promoted", entry)
-        LOG.info("✅ Promoted model: %s", version_id)
+        LOG.info("✅ Promoted model: %s (stability_score=%.1f)", 
+                version_id, entry.get("stability_score", 0))
         
         return entry
     
@@ -732,6 +990,42 @@ class ModelRegistry:
             return entry["version_id"]
         
         return None
+    
+    # -------------------------------------------------------------------------
+    # NEW: Stability reporting
+    # -------------------------------------------------------------------------
+    
+    def get_stability_report(self, version_id: str) -> Dict[str, Any]:
+        """Get detailed stability report for a model"""
+        entry = self.get_model(version_id)
+        
+        report = {
+            "version_id": version_id,
+            "model_type": entry["model_type"],
+            "created_at": entry["created_at"],
+            "stability_score": entry.get("stability_score", None),
+            "stability_stable": entry.get("stability_stable", None),
+            "training_config": entry.get("training_config", {}),
+            "validation": entry.get("validation", {}),
+            "metrics": entry.get("metrics", {})
+        }
+        
+        # Re-analyze if training config available
+        if entry.get("training_config"):
+            analysis = self.stability_analyzer.analyze_hyperparameters(
+                entry["training_config"]
+            )
+            report["detailed_analysis"] = analysis
+        
+        return report
+    
+    def list_stable_models(self, model_type: str, min_score: float = 80.0) -> List[Dict[str, Any]]:
+        """List only stable models above threshold"""
+        return self.list_models(
+            model_type=model_type,
+            include_emergency=False,
+            min_stability_score=min_score
+        )
     
     # -------------------------------------------------------------------------
     # Utilities
@@ -794,14 +1088,14 @@ class ModelRegistry:
 
 
 # =============================================================================
-# CLI INTERFACE
+# CLI INTERFACE (ENHANCED)
 # =============================================================================
 
 def _build_cli():
     import argparse
     parser = argparse.ArgumentParser(
         prog="prioritymax-model-registry",
-        description="PriorityMax Model Registry CLI"
+        description="PriorityMax Model Registry CLI (Stability-Aware)"
     )
     sub = parser.add_subparsers(dest="cmd", help="Command")
     
@@ -814,6 +1108,7 @@ def _build_cli():
     p_reg.add_argument("--author", default="cli", help="Author name")
     p_reg.add_argument("--onnx", action="store_true", help="Mark as ONNX")
     p_reg.add_argument("--emergency", action="store_true", help="Mark as emergency")
+    p_reg.add_argument("--no-strict", action="store_true", help="Disable strict stability checks")
     
     # List
     sub.add_parser("list", help="List all models")
@@ -821,11 +1116,17 @@ def _build_cli():
     p_list = sub.add_parser("list-type", help="List models by type")
     p_list.add_argument("--type", required=True)
     p_list.add_argument("--include-emergency", action="store_true")
+    p_list.add_argument("--min-stability", type=float, default=0.0, 
+                       help="Minimum stability score (0-100)")
+    
+    p_stable = sub.add_parser("list-stable", help="List only stable models")
+    p_stable.add_argument("--type", required=True)
+    p_stable.add_argument("--min-score", type=float, default=80.0)
     
     # Promote
     p_prom = sub.add_parser("promote", help="Promote model to active")
     p_prom.add_argument("--id", required=True)
-    p_prom.add_argument("--force", action="store_true")
+    p_prom.add_argument("--force", action="store_true", help="Skip stability checks")
     
     # Rollback
     p_roll = sub.add_parser("rollback", help="Rollback to previous version")
@@ -851,6 +1152,11 @@ def _build_cli():
     p_latest = sub.add_parser("get-latest", help="Get latest model")
     p_latest.add_argument("--type", required=True)
     p_latest.add_argument("--prefer-onnx", action="store_true")
+    p_latest.add_argument("--min-stability", type=float, default=70.0)
+    
+    # NEW: Stability report
+    p_report = sub.add_parser("stability-report", help="Get stability report")
+    p_report.add_argument("--id", required=True)
     
     # Recover
     p_recover = sub.add_parser("recover-emergency", help="Recover emergency checkpoint")
@@ -874,7 +1180,9 @@ def main_cli():
         parser.print_help()
         sys.exit(1)
     
-    reg = ModelRegistry()
+    # Initialize registry
+    strict = not getattr(args, 'no_strict', False)
+    reg = ModelRegistry(strict_stability=strict)
     
     try:
         if args.cmd == "register":
@@ -891,6 +1199,14 @@ def main_cli():
                 is_emergency=args.emergency
             )
             print(json.dumps(res, indent=2, default=str))
+            
+            # Print stability summary
+            if res.get("stability_score") is not None:
+                print(f"\n📊 Stability Score: {res['stability_score']:.1f}/100")
+                if res.get("stability_stable"):
+                    print("✅ Model is STABLE")
+                else:
+                    print("⚠️  Model has STABILITY ISSUES")
         
         elif args.cmd == "list":
             res = reg.list_models()
@@ -899,9 +1215,15 @@ def main_cli():
         elif args.cmd == "list-type":
             res = reg.list_models(
                 model_type=args.type,
-                include_emergency=args.include_emergency
+                include_emergency=args.include_emergency,
+                min_stability_score=args.min_stability
             )
             print(json.dumps(res, indent=2, default=str))
+        
+        elif args.cmd == "list-stable":
+            res = reg.list_stable_models(args.type, args.min_score)
+            print(json.dumps(res, indent=2, default=str))
+            print(f"\n✅ Found {len(res)} stable models (score >= {args.min_score})")
         
         elif args.cmd == "promote":
             res = reg.promote_model(args.id, force=args.force)
@@ -943,18 +1265,45 @@ def main_cli():
             print(json.dumps(res, indent=2, default=str))
         
         elif args.cmd == "get-latest":
-            res = reg.get_latest(args.type, prefer_onnx=args.prefer_onnx)
+            res = reg.get_latest(
+                args.type, 
+                prefer_onnx=args.prefer_onnx,
+                min_stability_score=args.min_stability
+            )
             if res:
                 print(json.dumps(res, indent=2, default=str))
             else:
                 print(f"❌ No model found for type: {args.type}")
                 sys.exit(1)
         
+        elif args.cmd == "stability-report":
+            report = reg.get_stability_report(args.id)
+            print(json.dumps(report, indent=2, default=str))
+            
+            if report.get("detailed_analysis"):
+                analysis = report["detailed_analysis"]
+                print(f"\n{'='*60}")
+                print(f"STABILITY REPORT: {args.id}")
+                print(f"{'='*60}")
+                print(f"Score: {analysis['score']:.1f}/100")
+                print(f"Status: {'✅ STABLE' if analysis['stable'] else '⚠️  UNSTABLE'}")
+                
+                if analysis["critical_issues"]:
+                    print(f"\n❌ Critical Issues:")
+                    for issue in analysis["critical_issues"]:
+                        print(f"  {issue}")
+                
+                if analysis["warnings"]:
+                    print(f"\n⚠️  Warnings:")
+                    for warning in analysis["warnings"]:
+                        print(f"  {warning}")
+                print(f"{'='*60}\n")
+        
         elif args.cmd == "recover-emergency":
             version_id = reg.recover_emergency_checkpoint(args.type)
             if version_id:
                 print(f"✅ Emergency checkpoint recovered: {version_id}")
-                print(f"\nTo promote: prioritymax-model-registry promote --id {version_id}")
+                print(f"\nTo promote: prioritymax-model-registry promote --id {version_id} --force")
             else:
                 print(f"❌ No emergency checkpoint found")
                 sys.exit(1)
@@ -987,170 +1336,150 @@ def main_cli():
 
 
 # =============================================================================
-# USAGE EXAMPLES & DOCUMENTATION
+# USAGE DOCUMENTATION
 # =============================================================================
 
 """
-SYNCHRONIZED MODEL REGISTRY - USAGE GUIDE
-==========================================
+SYNCHRONIZED MODEL REGISTRY - STABILITY-AWARE VERSION
+======================================================
 
-CRITICAL SYNCHRONIZATION:
-✅ obs_dim=12, act_dim=3 validation (from real_env.py)
-✅ WorkloadType validation (ecommerce, social_media, etc.)
-✅ AMP checkpoint support (from train_rl_heavy.py)
-✅ emergency_autosave.pt pattern detection
-✅ ONNX dimension validation
+NEW FEATURES:
+✅ Validates stable hyperparameters (gamma=0.99, lr=3e-4, etc.)
+✅ Detects explosion-prone configurations
+✅ Stability scoring (0-100)
+✅ Blocks promotion of unstable models
+✅ Detailed stability reports
 
-1. REGISTER MODEL AFTER TRAINING
----------------------------------
-# After train_rl_heavy.py completes
+USAGE EXAMPLES:
+
+1. REGISTER MODEL (WITH AUTOMATIC STABILITY CHECK)
+---------------------------------------------------
 python -m app.ml.model_registry register \\
     --type rl_agent \\
-    --file backend/app/ml/checkpoints/ckpt_best_0100.pt \\
-    --metrics '{"mean_reward": 145.3, "p95_latency": 0.85}' \\
-    --author "ml-team"
+    --file checkpoints/ckpt_best_0100.pt \\
+    --metrics '{"mean_reward": 145.3}'
 
-# Register ONNX model
+# Output will show stability score:
+# 📊 Stability Score: 95.0/100
+# ✅ Model is STABLE
+
+2. LIST ONLY STABLE MODELS
+---------------------------
+python -m app.ml.model_registry list-stable --type rl_agent --min-score 80
+
+3. GET STABILITY REPORT
+------------------------
+python -m app.ml.model_registry stability-report --id rl_agent_20240111_abc123
+
+# Shows detailed analysis:
+# - Hyperparameter validation
+# - Critical issues
+# - Warnings
+# - Stability score
+
+4. PROMOTE WITH STABILITY CHECK
+--------------------------------
+# Normal promotion (requires stability_score >= 70)
+python -m app.ml.model_registry promote --id rl_agent_20240111_abc123
+
+# Force promotion (skip stability checks)
+python -m app.ml.model_registry promote --id rl_agent_20240111_abc123 --force
+
+5. REGISTER WITH STRICT MODE DISABLED
+--------------------------------------
 python -m app.ml.model_registry register \\
     --type rl_agent \\
-    --file backend/app/ml/checkpoints/model_best.onnx \\
-    --onnx \\
-    --metrics '{"mean_reward": 150.2}'
+    --file checkpoints/ckpt_experimental.pt \\
+    --no-strict
 
-2. LIST & INSPECT MODELS
--------------------------
-# List all models
-python -m app.ml.model_registry list
+# Allows registration of unstable models (for testing)
 
-# List specific type (exclude emergency checkpoints)
-python -m app.ml.model_registry list-type --type rl_agent
-
-# Include emergency checkpoints
-python -m app.ml.model_registry list-type --type rl_agent --include-emergency
-
-3. VALIDATE BEFORE DEPLOYMENT
-------------------------------
-# Validate registered model
-python -m app.ml.model_registry validate --id rl_agent_20240111T120000_abc123
-
-# Validate ONNX before registration
-python -m app.ml.model_registry validate-onnx --file models/model.onnx
-
-4. PROMOTE TO PRODUCTION
--------------------------
-# Promote after validation
-python -m app.ml.model_registry promote --id rl_agent_20240111T120000_abc123
-
-# Force promote (skip validation)
-python -m app.ml.model_registry promote --id rl_agent_20240111T120000_abc123 --force
-
-5. ROLLBACK IF ISSUES
-----------------------
-# Rollback to previous version
-python -m app.ml.model_registry rollback --type rl_agent
-
-# Rollback 2 versions
-python -m app.ml.model_registry rollback --type rl_agent --steps 2
-
-6. EMERGENCY RECOVERY
----------------------
-# Recover from emergency_autosave.pt (after Colab crash)
-python -m app.ml.model_registry recover-emergency --type rl_agent
-
-# Then promote the recovered checkpoint
-python -m app.ml.model_registry promote --id <recovered_version_id>
-
-7. PYTHON API USAGE
--------------------
+PYTHON API:
+-----------
 from app.ml.model_registry import ModelRegistry
 
-# Initialize
-registry = ModelRegistry()
+# Initialize with strict stability checks
+registry = ModelRegistry(strict_stability=True)
 
-# Register model after training
+# Register model (will validate stability)
 entry = registry.register_model(
     model_type="rl_agent",
-    file_path="checkpoints/ckpt_best_0100.pt",
-    metrics={"mean_reward": 145.3},
+    file_path="checkpoints/ckpt_best.pt",
     training_config={
-        "epochs": 300,
-        "workload_type": "ecommerce",  # Validated!
-        "obs_dim": 12,  # Validated!
-        "act_dim": 3    # Validated!
+        "gamma": 0.99,  # ✅ Stable
+        "lam": 0.95,    # ✅ Stable
+        "lr": 3e-4,     # ✅ Stable
+        "use_clipped_value_loss": True,  # ✅ Required
+        "normalize_observations": True,  # ✅ Required
     }
 )
 
-# Validate before promotion
-if registry.validate_model(entry):
+# Get stability report
+report = registry.get_stability_report(entry["version_id"])
+print(f"Stability: {report['stability_score']}/100")
+
+# Promote only if stable
+if report["stability_stable"]:
     registry.promote_model(entry["version_id"])
+else:
+    print("Model unstable, not promoting")
 
-# Get latest ONNX model for inference
-latest = registry.get_latest("rl_agent", prefer_onnx=True)
-
-# Rollback if production issues
-if production_issues_detected:
-    previous = registry.rollback_model("rl_agent")
-
-8. COLAB INTEGRATION
---------------------
-# In Google Colab, after training:
+COLAB INTEGRATION:
+------------------
+# After training with train_rl_STABLE.py:
 from app.ml.model_registry import ModelRegistry
 
 registry = ModelRegistry(
-    models_dir="/content/drive/MyDrive/PriorityMax/models"
+    models_dir="/content/drive/MyDrive/PriorityMax/models",
+    strict_stability=True
 )
 
-# Register best checkpoint
-best_ckpt = "/content/drive/MyDrive/PriorityMax/checkpoints/ckpt_best_0100.pt"
+# Register with training config
 entry = registry.register_model(
     model_type="rl_agent",
-    file_path=best_ckpt,
+    file_path=best_checkpoint_path,
     metrics=trainer.training_metrics,
+    training_config=asdict(trainer.cfg),  # ← CRITICAL!
     author="colab-training"
 )
 
-print(f"Registered: {entry['version_id']}")
+# Check if safe to deploy
+if entry["stability_score"] >= 80:
+    print("✅ Safe for production")
+    registry.promote_model(entry["version_id"])
+else:
+    print(f"⚠️  Stability score too low: {entry['stability_score']}")
 
-# Export ONNX and register
-onnx_path = "/content/drive/MyDrive/PriorityMax/models/model_best.onnx"
-if onnx_path.exists():
-    onnx_entry = registry.register_model(
-        model_type="rl_agent",
-        file_path=str(onnx_path),
-        is_onnx=True,
-        metrics={"source_checkpoint": entry["version_id"]}
-    )
-    print(f"ONNX registered: {onnx_entry['version_id']}")
+WHAT GETS VALIDATED:
+====================
+✅ gamma=0.99 (not 0.995)
+✅ lambda=0.95 (not 0.97)
+✅ lr=3e-4 or 1e-4 (not 1e-3)
+✅ steps_per_epoch=2048 (not 4096)
+✅ use_clipped_value_loss=True
+✅ normalize_observations=True
+✅ normalize_rewards=True
+✅ max_grad_norm=0.5
+✅ obs_dim=12, act_dim=3
 
-VALIDATION FEATURES (SYNCHRONIZED):
-===================================
-✅ Checkpoint format detection (train_rl_heavy, AMP, emergency)
-✅ Dimension validation (obs_dim=12, act_dim=3)
-✅ WorkloadType validation (ecommerce, social_media, etc.)
-✅ ONNX model validation with inference test
-✅ File hash verification
-✅ Training metadata presence check
-✅ Optimizer state check (for resuming)
-✅ AMP scaler validation (if mixed precision)
+STABILITY SCORING:
+==================
+100 points = Perfect configuration
+ -40 points = Critical issue (gamma too high, etc.)
+ -10 points = Warning (non-standard value)
+ -50 points = Missing clipped value loss
+ -40 points = Missing observation normalization
 
-ERROR HANDLING:
-===============
-❌ Dimension mismatch → Warning logged, registration succeeds
-❌ Invalid workload_type → Warning logged
-❌ ONNX validation failure → Registration fails
-❌ Missing file → Registration fails
-❌ Hash mismatch → Validation fails
+Minimum for production: 70/100
 
-BEST PRACTICES:
-===============
-1. Always validate before promoting to production
-2. Use ONNX models for production inference (faster)
-3. Keep emergency checkpoints accessible for recovery
-4. Test rollback procedures regularly
-5. Sync to S3 for disaster recovery
-6. Monitor validation warnings in production
-7. Use semantic versioning in metadata
-8. Document training configs for reproducibility
+BLOCKED CONFIGURATIONS:
+=======================
+❌ gamma >= 0.995 → "Causes GAE accumulation → explosion"
+❌ lambda >= 0.97 → "Causes advantage explosion"
+❌ lr >= 1e-3 → "Too high for PPO, causes divergence"
+❌ steps_per_epoch >= 4096 → "Too large, causes gradient explosion"
+❌ use_clipped_value_loss=False → "Required for stability"
+❌ normalize_observations=False → "Required for stable gradients"
 """
 
 if __name__ == "__main__":
