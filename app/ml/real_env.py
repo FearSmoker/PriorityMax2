@@ -229,9 +229,9 @@ class EnvConfig:
     cost_data_transfer_per_gb: float = 0.01
     
     # SLA targets
-    sla_latency_p50_ms: float = 200.0
-    sla_latency_p95_ms: float = 500.0
-    sla_latency_p99_ms: float = 1000.0
+    sla_latency_p50_ms: float = 500.0
+    sla_latency_p95_ms: float = 2000.0
+    sla_latency_p99_ms: float = 4000.0
     sla_success_rate: float = 0.995
     sla_availability: float = 0.999
     
