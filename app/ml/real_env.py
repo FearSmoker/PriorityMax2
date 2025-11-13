@@ -184,7 +184,7 @@ class EnvConfig:
     
     # === WORKLOAD (TUNED FOR STABLE TRAINING) ===
     workload_type: str = "ecommerce"
-    base_arrival_rate: float = 15.0
+    base_arrival_rate: float = 10.0
     peak_arrival_multiplier: float = 5.0          # Reduced from 8.0
     flash_crowd_probability: float = 0.005         # Reduced from 0.03
     flash_crowd_duration_steps: int = 15          # Reduced from 30
@@ -197,7 +197,7 @@ class EnvConfig:
     seasonal_variation: float = 0.2               # Reduced from 0.3
     
     # Queue and latency
-    max_queue_size: int = 100000
+    max_queue_size: int = 200000
     base_latency_ms: float = 50.0
     latency_per_queue_item: float = 0.05
     network_latency_ms: float = 20.0
@@ -258,7 +258,7 @@ class EnvConfig:
     
     # Circuit breaker
     enable_circuit_breaker: bool = True
-    circuit_breaker_threshold: int = 100
+    circuit_breaker_threshold: int = 500
     circuit_breaker_window_seconds: int = 120
     
     # Seed
